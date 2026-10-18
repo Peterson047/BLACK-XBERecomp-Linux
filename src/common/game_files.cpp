@@ -178,24 +178,13 @@ bool FindGame(GameFiles& game) {
     fs::path assets = FindAssets();
     std::vector<fs::path> isos;
     std::error_code ec;
-
-    auto scan_dir_for_isos = [&](const fs::path& dir) {
-        if (dir.empty() || !fs::is_directory(dir, ec)) return;
-        for (auto& e : fs::directory_iterator(dir, ec)) {
+    if (!assets.empty())
+        for (auto& e : fs::directory_iterator(assets, ec)) {
             std::wstring ext = e.path().extension().wstring();
             std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
             if (ext == L".iso" && (e.is_regular_file(ec) || e.is_symlink(ec))) isos.push_back(e.path());
         }
-    };
-
-    scan_dir_for_isos(assets);
-    if (assets.has_parent_path()) scan_dir_for_isos(assets.parent_path());
-    scan_dir_for_isos(ExeDir());
-    if (ExeDir().has_parent_path()) scan_dir_for_isos(ExeDir().parent_path());
-    scan_dir_for_isos(fs::current_path());
-
     std::sort(isos.begin(), isos.end());
-    isos.erase(std::unique(isos.begin(), isos.end()), isos.end());
 
     // the first copy with this xbe wins, the extracted files before any image; another release is kept to offer
     GameFiles other;
