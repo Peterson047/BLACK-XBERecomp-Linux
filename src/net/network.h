@@ -10,7 +10,7 @@
 namespace net {
 
 constexpr uint32_t kProtocolMagic = 0x424C4143; // 'BLAC'
-constexpr uint16_t kDefaultPort = 7777;
+constexpr uint16_t kDefaultPort = 1508;
 constexpr size_t kMaxPlayers = 8;
 constexpr float kTimeoutSeconds = 5.0f;
 
@@ -95,6 +95,11 @@ struct RemotePlayer {
     float ping_ms = 0.0f;
     std::chrono::steady_clock::time_point last_seen{};
     bool just_fired = false;
+
+    // Entity Interpolation (cl_interp GoldSrc style)
+    float prev_pos[3]{};
+    float current_pos[3]{};
+    float interp_alpha = 1.0f;
 };
 
 enum class NetMode {

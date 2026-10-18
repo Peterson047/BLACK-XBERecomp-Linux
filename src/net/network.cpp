@@ -236,6 +236,15 @@ std::vector<RemotePlayer> NetworkManager::GetPlayers() {
 void NetworkManager::Update(float dt) {
     if (mode_ == NetMode::Offline) return;
 
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& p : players_) {
+            if (p.active) {
+                p.interp_alpha = std::min(1.0f, p.interp_alpha + dt * 30.0f);
+            }
+        }
+    }
+
     ProcessIncomingPackets();
     CheckTimeouts();
 
@@ -359,6 +368,12 @@ void NetworkManager::HandlePacket(const uint8_t* data, size_t size, void* sender
         if (type == MsgType::StateUpdate) {
             if (size < sizeof(PacketState)) return;
             const auto* st = reinterpret_cast<const PacketState*>(data);
+
+            // Interpolation buffer update
+            std::memcpy(players_[sender_id].prev_pos, players_[sender_id].current_pos, sizeof(float) * 3);
+            std::memcpy(players_[sender_id].current_pos, st->state.pos, sizeof(float) * 3);
+            players_[sender_id].interp_alpha = 0.0f;
+
             players_[sender_id].state = st->state;
 
             // Forward state to other clients
@@ -452,6 +467,12 @@ void NetworkManager::HandlePacket(const uint8_t* data, size_t size, void* sender
                 if (players_[pid].name.empty()) {
                     players_[pid].name = (pid == 0) ? "Host" : ("Player " + std::to_string(pid + 1));
                 }
+
+                // Interpolation buffer update
+                std::memcpy(players_[pid].prev_pos, players_[pid].current_pos, sizeof(float) * 3);
+                std::memcpy(players_[pid].current_pos, st->state.pos, sizeof(float) * 3);
+                players_[pid].interp_alpha = 0.0f;
+
                 players_[pid].state = st->state;
                 players_[pid].last_seen = std::chrono::steady_clock::now();
             }
