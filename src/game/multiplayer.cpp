@@ -270,7 +270,30 @@ void MultiplayerManager::UpdateEnemyPuppet(uint8_t slot_idx, const Vec3& pos, co
         W32(actor, 0x28C1E8);
     }
 
-    // Set soldier coordinates & ground base (accounting for crouching posture)
+    // Orient character's 3D affine matrix to face look direction
+    Vec3 fwd = Normalize(Vec3(forward.x, 0.0f, forward.z));
+    Vec3 up(0.0f, 1.0f, 0.0f);
+    Vec3 right = Normalize(Cross(up, fwd));
+
+    // Row 0: Right (0x70)
+    G<float>(actor + 0x70) = right.x;
+    G<float>(actor + 0x74) = right.y;
+    G<float>(actor + 0x78) = right.z;
+    G<float>(actor + 0x7C) = 0.0f;
+
+    // Row 1: Up (0x80)
+    G<float>(actor + 0x80) = up.x;
+    G<float>(actor + 0x84) = up.y;
+    G<float>(actor + 0x88) = up.z;
+    G<float>(actor + 0x8C) = 0.0f;
+
+    // Row 2: Forward (0x90)
+    G<float>(actor + 0x90) = fwd.x;
+    G<float>(actor + 0x94) = fwd.y;
+    G<float>(actor + 0x98) = fwd.z;
+    G<float>(actor + 0x9C) = 0.0f;
+
+    // Row 3: Position (0xA0) - base of feet
     float base_y = pos.y - (is_crouching ? 1.05f : 1.65f);
     G<float>(actor + 0xA0) = pos.x;
     G<float>(actor + 0xA4) = base_y;
@@ -285,14 +308,19 @@ void MultiplayerManager::UpdateEnemyPuppet(uint8_t slot_idx, const Vec3& pos, co
     // Locomotion and animation controller
     uint32_t loc = R32(actor + 0x324);
     if (loc) {
-        W32(loc + 0x90, 0); // Disable campaign AI autonomous movement/logic
+        W32(loc + 0x90, 1); // Normal character locomotion
         G<uint8_t>(loc + 0x40) = is_crouching ? 1 : 0;
-        G<float>(loc + 0x84) = move_rate;
-        G<float>(loc + 0x2D8) = move_rate;
-        G<float>(loc + 0x80) = yaw;
-        G<float>(loc + 0x14) = yaw;
-        G<float>(loc + 0x10) = yaw;
-        G<float>(loc + 0x1C) = pitch;
+        G<float>(loc + 0x84) = move_rate; // 0.0f for idle, 4.5f for walking/running
+        G<float>(loc + 0x2D8) = 4.0f;     // Base run rate reference (prevents negative multiplier)
+
+        // Angles converted to DEGREES for the Black engine
+        float yaw_deg = yaw * (180.0f / 3.14159265f);
+        float pitch_deg = pitch * (180.0f / 3.14159265f);
+
+        G<float>(loc + 0x80) = 0.0f;      // Movement relative to facing (0 deg = straight ahead)
+        G<float>(loc + 0x14) = yaw_deg;   // Body yaw (degrees)
+        G<float>(loc + 0x10) = yaw_deg;   // Aim yaw (degrees)
+        G<float>(loc + 0x1C) = pitch_deg; // Aim pitch (degrees: -90 to +90)
     }
 
     // Mark active and highest detail level
@@ -490,12 +518,11 @@ void MultiplayerManager::Update(float dt) {
             }
             Vec3 rfwd(rpl.state.forward[0], rpl.state.forward[1], rpl.state.forward[2]);
 
-            // Calculate movement rate (speed)
-            Vec3 delta = rpos - Vec3(rpl.prev_pos[0], rpl.prev_pos[1], rpl.prev_pos[2]);
-            float move_dist = std::sqrt(delta.x * delta.x + delta.z * delta.z);
-            float move_rate = std::clamp(move_dist / (dt * 4.5f), 0.0f, 1.0f);
-
+            // Check authoritative movement state from network flags
             bool r_crouching = (rpl.state.flags & (1 << 2)) != 0;
+            bool r_moving = (rpl.state.flags & (1 << 4)) != 0;
+            float move_rate = r_moving ? (r_crouching ? 2.5f : 4.5f) : 0.0f;
+
             float r_yaw = rpl.state.yaw;
             float r_pitch = rpl.state.pitch;
 
@@ -512,6 +539,14 @@ void MultiplayerManager::Update(float dt) {
     float base_feet_y = G<float>(p + 0xA0 + 4);
     float eye_height = (base_feet_y > -100.0f && base_feet_y < 100.0f) ? (eye.y - base_feet_y) : 1.70f;
     bool is_crouching = (eye_height < 1.35f);
+
+    // Local movement speed detection
+    static Vec3 s_last_local_eye = eye;
+    Vec3 move_delta = eye - s_last_local_eye;
+    s_last_local_eye = eye;
+    float horizontal_move = std::sqrt(move_delta.x * move_delta.x + move_delta.z * move_delta.z);
+    float local_speed = (dt > 0.0001f) ? (horizontal_move / dt) : 0.0f;
+    bool is_moving = (local_speed > 0.35f);
 
     float local_yaw = std::atan2(forward.x, forward.z);
     float local_pitch = std::asin(std::clamp(forward.y, -1.0f, 1.0f));
@@ -531,7 +566,7 @@ void MultiplayerManager::Update(float dt) {
         data.yaw = local_yaw;
         data.pitch = local_pitch;
         data.weapon_id = weapon;
-        data.flags = (firing ? 1 : 0) | (aiming ? 2 : 0) | (is_crouching ? (1 << 2) : 0);
+        data.flags = (firing ? 1 : 0) | (aiming ? 2 : 0) | (is_crouching ? (1 << 2) : 0) | (is_moving ? (1 << 4) : 0);
         data.health = local_health_;
         data.frags = static_cast<uint16_t>(local_frags_);
         data.deaths = static_cast<uint16_t>(local_deaths_);
