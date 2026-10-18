@@ -23,6 +23,8 @@
 #include "gpu/backend.h"
 #include "image_symbols.h"
 #include "kernel/kernel.h"
+#include "net/network.h"
+#include "game/multiplayer.h"
 
 namespace app {
 
@@ -129,8 +131,36 @@ int main(int argc, char** argv) {
     std::signal(SIGFPE, CrashHandler);
 
     bool relaunched = false;
+    bool is_host = false;
+    uint16_t host_port = net::kDefaultPort;
+    std::string connect_ip = "";
+    uint16_t connect_port = net::kDefaultPort;
+    std::string player_name = "";
+
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--relaunched") == 0) relaunched = true;
+        if (std::strcmp(argv[i], "--relaunched") == 0) {
+            relaunched = true;
+        } else if (std::strcmp(argv[i], "--host") == 0) {
+            is_host = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                host_port = static_cast<uint16_t>(std::atoi(argv[++i]));
+            }
+        } else if (std::strcmp(argv[i], "--connect") == 0) {
+            if (i + 1 < argc) {
+                std::string arg = argv[++i];
+                size_t colon = arg.find(':');
+                if (colon != std::string::npos) {
+                    connect_ip = arg.substr(0, colon);
+                    connect_port = static_cast<uint16_t>(std::atoi(arg.substr(colon + 1).c_str()));
+                } else {
+                    connect_ip = arg;
+                }
+            }
+        } else if (std::strcmp(argv[i], "--name") == 0 || std::strcmp(argv[i], "--player-name") == 0) {
+            if (i + 1 < argc) {
+                player_name = argv[++i];
+            }
+        }
     }
 
     std::string log = app::kGame.log;
@@ -139,6 +169,16 @@ int main(int argc, char** argv) {
     if (app::kGame.init) app::kGame.init();
     if (relaunched && !logx::kVerbose) LOGR("Relaunched: %s", IMAGE_XBE);
     else app::LogSystem();
+
+    game::MultiplayerManager::Get().Init();
+    if (!player_name.empty()) {
+        net::NetworkManager::Get().SetLocalPlayerName(player_name);
+    }
+    if (is_host) {
+        net::NetworkManager::Get().StartHost(host_port);
+    } else if (!connect_ip.empty()) {
+        net::NetworkManager::Get().ConnectTo(connect_ip, connect_port);
+    }
 
     app::GameFiles game;
     if (!app::FindGame(game)) {

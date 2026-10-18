@@ -33,6 +33,7 @@
 #include "common/mouse_keyboard.h"
 #include "common/options.h"
 #include "common/translations.h"
+#include "game/multiplayer.h"
 
 namespace app {
 
@@ -534,11 +535,13 @@ std::string KeyText(std::string keys) {
     return keys;
 }
 
-const char* const kPages[] = {"RECOMP SETTINGS", "MOUSE AND KEYBOARD"};
+const char* const kPages[] = {"RECOMP SETTINGS", "MOUSE AND KEYBOARD", "MULTIPLAYER"};
 constexpr int kSettingsPage = 0;
 constexpr int kKeyboardPage = 1;
+constexpr int kMultiplayerPage = 2;
 
 void RestoreDefaults(int page) {
+    if (page == kMultiplayerPage) return;
     game::Options& o = game::Opt();
     if (page == kKeyboardPage) {
         o.mouse_sensitivity = game::Options{}.mouse_sensitivity;
@@ -686,6 +689,10 @@ void KeyRow(const Row& r) {
 }
 
 void DrawRows(int page) {
+    if (page == kMultiplayerPage) {
+        game::MultiplayerManager::Get().DrawImGuiMenu();
+        return;
+    }
     size_t count = 0;
     const Row* list = rows::Page(page, &count);
     for (size_t i = 0; i < count; i++) {
@@ -748,6 +755,7 @@ void DrawFooter(float em) {
     const char* hint = "";
     if (g_capture >= 0) hint = "Press a key or mouse button to bind, Escape cancels";
     else if (g_page == kKeyboardPage && g_hovered_box >= 0) hint = "Right click or Delete clears the key";
+    else if (g_page == kMultiplayerPage) hint = "LAN / Dedicated Server Deathmatch MVP (Mission 1)";
     ImGui::TextUnformatted(Ui(hint, false).c_str());
     ImGui::PopStyleColor();
     float bw = em * 8;
@@ -846,6 +854,10 @@ void PaceFrame() {
 }
 
 const rows::Row* rows::Page(int page, size_t* count) {
+    if (page == kMultiplayerPage) {
+        *count = 0;
+        return nullptr;
+    }
     if (page == kKeyboardPage) {
         *count = InputRows().size();
         return InputRows().data();
@@ -887,6 +899,12 @@ void DrawUi(double fps) {
     io.KeyRepeatRate = 0.1f;  // held arrows step ten times a second, ImGui's twenty is too fast for settings
     // scale the font with the output height
     io.FontGlobalScale = std::max(1.0f, io.DisplaySize.y / 720.0f);
+
+    // Multiplayer tick and in-game 3D HUD
+    float dt = (fps > 0) ? float(1.0 / fps) : 0.016f;
+    game::MultiplayerManager::Get().Update(dt);
+    game::MultiplayerManager::Get().DrawImGuiHUD();
+
     if (MenuOpen()) {
         PollCapture();
         DrawPanel();
