@@ -49,10 +49,18 @@ void ApplyNow() {
     Mode out = Output();
 
     if (s.display_mode == DisplayMode::Fullscreen) {
+        SDL_SetWindowBordered(g_window, false);
         SDL_SetWindowFullscreen(g_window, true);
         g_fullscreen = true;
+    } else if (s.display_mode == DisplayMode::Borderless) {
+        SDL_SetWindowFullscreen(g_window, false);
+        SDL_SetWindowBordered(g_window, false);
+        SDL_SetWindowSize(g_window, int(out.width), int(out.height));
+        SDL_SetWindowPosition(g_window, 0, 0);
+        g_fullscreen = false;
     } else {
         SDL_SetWindowFullscreen(g_window, false);
+        SDL_SetWindowBordered(g_window, true);
         SDL_SetWindowSize(g_window, int(out.width), int(out.height));
         SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
         g_fullscreen = false;
