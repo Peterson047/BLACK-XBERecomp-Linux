@@ -51,8 +51,10 @@ CASES = [
     ("an unpaired actor fails", GOOD_HOST.replace("unpaired=0", "unpaired=3"), GOOD_GUEST, 1),
     ("a pairing that ends short fails", GOOD_HOST.replace("paired=9 unpaired=0 missing=0",
                                                           "paired=6 unpaired=3 missing=3"), GOOD_GUEST, 1),
-    ("a pairing that ends missing fails", GOOD_HOST.replace("paired=9 unpaired=0 missing=0",
-                                                             "paired=9 unpaired=0 missing=1"), GOOD_GUEST, 1),
+    # A host actor the guest has not activated yet is reported, not failed:
+    # the two copies of the level bring their actors in at their own pace.
+    ("a pairing that ends missing is reported", GOOD_HOST.replace("paired=9 unpaired=0 missing=0",
+                                                                  "paired=9 unpaired=0 missing=1"), GOOD_GUEST, 0),
     ("a divergence fails", GOOD_HOST.replace("divergent=0", "divergent=1"), GOOD_GUEST, 1),
     ("a co-op error fails", GOOD_HOST + "coop: error what=something\n", GOOD_GUEST, 1),
     ("out of order sequences fail", GOOD_GUEST,

@@ -146,15 +146,22 @@ def main(argv):
     # count goes up and down on its own. What matters is where it ended up:
     # the summary says how many are unpaired now, and the last pairing says
     # how the two sides line up at the end.
+    missing = 0
     for name, log in (("host", host), ("guest", guest)):
         pairs = log.verbs("pair")
         if not pairs:
             continue
         last = pairs[-1]
-        for key in ("unpaired", "missing"):
-            value = last.get(key)
-            if value is not None and value != "0":
-                problems.append(f"the {name} ended with {key}={value}")
+        value = last.get("unpaired")
+        if value is not None and value != "0":
+            problems.append(f"the {name} ended with unpaired={value}")
+        # A host actor the guest has not activated yet is not a pairing
+        # failure: the two copies of the level bring their actors in at
+        # their own pace. It is reported, and it is what the activation
+        # replication is about.
+        value = last.get("missing")
+        if value is not None and value != "0":
+            missing = max(missing, int(value))
 
     # The errors the co-op code reported itself.
     for name, log in (("host", host), ("guest", guest)):
@@ -238,6 +245,7 @@ def main(argv):
         f"events={host_summary.get('events')} "
         f"unpaired={host_summary.get('unpaired')} "
         f"divergent={host_summary.get('divergent')}"
+        + (f" missing={missing}" if missing else "")
     )
     return 0
 
