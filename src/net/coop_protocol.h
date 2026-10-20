@@ -128,6 +128,11 @@ struct EventState {
     float dir[3];         // the direction the damage came from
     uint16_t flags;       // the engine's seventh argument
     uint16_t reserved;
+    // The controller's hit state: the mode in the low byte and the body
+    // part in the next. The damage routine skips the damage when the body
+    // part is one of 29, 30 and 31, so the guest has to have the same
+    // state the host had, or the replay would not do what the host did.
+    uint32_t hit_state;
     uint32_t extra;       // who caused it, or a counter
     uint32_t event_id;    // the named event's id
     char text[2][96];     // the named event's two strings

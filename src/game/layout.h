@@ -107,6 +107,7 @@ constexpr uint32_t kActorGeneration = 0x374;
 constexpr uint32_t kActorHealth = 0x2F0;   // float
 constexpr uint32_t kActorState = 0x384;    // 0 alive, 1 recycled, 2 dead
 constexpr uint32_t kActorPosition = 0xA0;  // x, y, z: the matrix's last row
+constexpr uint32_t kActorController = 0x324;  // the controller; the corpse takes its place
 constexpr uint32_t kActorDirection = 0x20; // the world direction the engine keeps
 constexpr uint32_t kActorLocalDirection = 0x60;  // the direction in the actor's own frame
 constexpr uint32_t kActorBasis = 0x70;           // the matrix's three rows: 0x70, 0x80, 0x90

@@ -61,6 +61,20 @@ CASES = [
     ("disagreeing counters fail", GOOD_HOST,
      GOOD_GUEST.replace("events=42", "events=41"), 1),
     ("no coop lines at all fails", "nothing here\n", "nothing here\n", 1),
+    # the death has to cross: the guest has to apply the host's damage to the
+    # same actor
+    ("a death that did not cross fails",
+     GOOD_HOST + "coop: test what=kill reason=applied actor=9 key_a=11 key_b=22 generation=3\n",
+     GOOD_GUEST, 1),
+    ("a death that crossed passes",
+     GOOD_HOST + "coop: test what=kill reason=applied actor=9 key_a=11 key_b=22 generation=3\n",
+     GOOD_GUEST + "coop: apply kind=damage actor=9 key_a=11 key_b=22 generation=3 damage=1000 state=1\n", 0),
+    ("a death that crossed to another actor fails",
+     GOOD_HOST + "coop: test what=kill reason=applied actor=9 key_a=11 key_b=22 generation=3\n",
+     GOOD_GUEST + "coop: apply kind=damage actor=9 key_a=11 key_b=99 generation=3 damage=1000 state=1\n", 1),
+    ("an actor that is still alive after the death fails",
+     GOOD_HOST + "coop: test what=kill reason=applied actor=9 key_a=11 key_b=22 generation=3\n",
+     GOOD_GUEST + "coop: apply kind=damage actor=9 key_a=11 key_b=22 generation=3 damage=1000 state=0\n", 1),
 ]
 
 

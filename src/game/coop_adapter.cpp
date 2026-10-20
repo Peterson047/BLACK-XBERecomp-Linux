@@ -7,6 +7,7 @@
 #include "game/multiplayer.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace game {
 namespace coop {
@@ -14,6 +15,16 @@ namespace {
 
 // How often the host publishes the state of the world.
 constexpr float kSnapshotInterval = 0.1f;  // 10 Hz
+
+// The test harness: BLACK_COOP_TEST_KILL=1 makes the host kill an enemy, so
+// the replication of the death can be checked by the log gate.
+bool TestKillEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BLACK_COOP_TEST_KILL");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
 
 }  // namespace
 
@@ -32,10 +43,13 @@ Adapter::Adapter() {
         World::Get().ApplyEvent(event);
         Mission::Get().ApplyEvent(event);
     });
-    session_.SetRoundHandler([](uint32_t epoch, bool started) {
+    session_.SetRoundHandler([this](uint32_t epoch, bool started) {
         if (!started) return;
         World::Get().ResetRound(epoch);
         Mission::Get().ResetRound(epoch);
+        // The test harness kills an enemy, so the replication of the death
+        // can be checked without a player at the keyboard.
+        if (TestKillEnabled()) test_kill_armed_ = true;
     });
 }
 
@@ -141,6 +155,14 @@ void Adapter::Tick(float dt) {
         // The events the level script fired.
         net::coop::Event event;
         while (Mission::Get().NextEvent(&event)) session_.PublishEvent(event);
+    }
+
+    // The test harness's kill, once there is an actor to kill. The level
+    // spawns its actors while it comes up, so this may take a moment.
+    if (test_kill_armed_ && session_.GetPhase() == net::coop::Phase::InMission) {
+        // ArmTestKill says false when there is no living actor yet; the
+        // question is asked again the next frame.
+        if (World::Get().ArmTestKill()) test_kill_armed_ = false;
     }
 
     // The guest applies what arrived, on the thread that may touch the

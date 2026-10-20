@@ -330,10 +330,61 @@ bool World::ReplayDamage(const net::coop::Event& event) {
         break;
     }
     if (!actor) {
+        // The same script object, activated in another order on the other
+        // side: the generation is the manager's activation counter and the
+        // two processes do not count in the same order.
+        //
+        // The pair at actor+0x08 / actor+0x0C is the engine's own key for
+        // the script object, so one candidate with that pair and that type
+        // is the actor. When there are several, the position tells them
+        // apart: the same script object can be activated again, and the
+        // second one is somewhere else.
+        std::vector<uint32_t> candidates;
+        for (uint32_t candidate : actors) {
+            if (R32(candidate + layout::coop::kActorKeyA) != state.native_a) continue;
+            if (R32(candidate + layout::coop::kActorKeyB) != state.native_b) continue;
+            if (static_cast<uint16_t>(R32(candidate + layout::coop::kActorType)) != state.object_type) continue;
+            candidates.push_back(candidate);
+        }
+        if (candidates.size() == 1) {
+            actor = candidates.front();
+        } else if (candidates.size() > 1) {
+            float best_distance = 0.0f;
+            for (uint32_t candidate : candidates) {
+                const float dx = G<float>(candidate + layout::coop::kActorPosition) - state.pos[0];
+                const float dy = G<float>(candidate + layout::coop::kActorPosition + 4) - state.pos[1];
+                const float dz = G<float>(candidate + layout::coop::kActorPosition + 8) - state.pos[2];
+                const float distance = dx * dx + dy * dy + dz * dz;
+                if (!actor || distance < best_distance) {
+                    actor = candidate;
+                    best_distance = distance;
+                }
+            }
+        }
+    }
+    if (!actor) {
         // the guest does not have the actor the event is about: it is either
         // already gone, which the death chain explains, or it never was
         // there, which is a divergence
         counters_.skipped++;
+        {
+            std::string keys;
+            for (uint32_t candidate : actors) {
+                keys += " " + std::to_string(R32(candidate + layout::coop::kActorKeyA)) + "/" +
+                        std::to_string(R32(candidate + layout::coop::kActorKeyB)) + "/" +
+                        std::to_string(R32(candidate + layout::coop::kActorGeneration)) + "/" +
+                        std::to_string(R32(candidate + layout::coop::kActorType));
+            }
+            LOGI("%s", game::coop::FormatLog("apply", {{"kind", "damage"},
+                                                       {"reason", "no_actor"},
+                                                       {"epoch", std::to_string(state.start_epoch)},
+                                                       {"want", std::to_string(state.native_a) + "/" +
+                                                                     std::to_string(state.native_b) + "/" +
+                                                                     std::to_string(state.generation) + "/" +
+                                                                     std::to_string(state.object_type)},
+                                                       {"have", keys}})
+                               .c_str());
+        }
         LOGI("%s", FormatLog("apply", {{"kind", "damage"},
                                        {"reason", "no_actor"},
                                        {"epoch", std::to_string(state.start_epoch)},
@@ -374,16 +425,50 @@ bool World::ReplayDamage(const net::coop::Event& event) {
 
     // the call: the engine's own damage routine, with the arguments it takes
     X86Context& ctx = CurrentContext();
+    const float before = G<float>(actor + layout::coop::kActorHealth);
+    const uint32_t controller = R32(actor + layout::coop::kActorController);
+    const uint32_t mode = controller ? R32(controller + 0x90) : 0;
+    const uint32_t part = controller ? R32(controller + 0xCA8) : 0;
+    // The controller's hit state, the way the host had it: the routine
+    // reads the body part and skips the damage for some of them.
+    const uint32_t guest_controller = R32(actor + layout::coop::kActorController);
+    uint32_t saved_mode = 0;
+    uint32_t saved_part = 0;
+    if (guest_controller) {
+        saved_mode = R32(guest_controller + 0x90);
+        saved_part = R32(guest_controller + 0xCA8);
+        W32(guest_controller + 0x90, state.hit_state & 0xFF);
+        W32(guest_controller + 0xCA8, (state.hit_state >> 8) & 0xFF);
+    }
     g_replay_depth++;
     ctx.ecx = actor;
     CallGuest(ctx, layout::coop::kDamageMethod,
               {actor + layout::coop::kActorPosition, scratch + kScratchHit, Bits(damage), event_ptr,
                Bits(radius), state.damage_type, state.flags});
     g_replay_depth--;
+    if (guest_controller) {
+        W32(guest_controller + 0x90, saved_mode);
+        W32(guest_controller + 0xCA8, saved_part);
+    }
+    const float after = G<float>(actor + layout::coop::kActorHealth);
+    LOGI("%s", game::coop::FormatLog("damage", {{"side", "guest"},
+                                    {"actor", std::to_string(actor)},
+                                    {"before", game::coop::LogNumber(before)},
+                                    {"after", game::coop::LogNumber(after)},
+                                    {"mode", std::to_string(mode)},
+                                    {"part", std::to_string(part)}})
+                           .c_str());
     counters_.applied++;
     LOGI("%s", FormatLog("apply", {{"kind", "damage"},
                                    {"actor", std::to_string(actor)},
+                                   {"key_a", std::to_string(state.native_a)},
+                                   {"key_b", std::to_string(state.native_b)},
+                                   {"generation", std::to_string(state.generation)},
                                    {"damage", LogNumber(damage)},
+                                   // The state word, not the life: a dead actor
+                                   // is recycled and its slot says nothing
+                                   // about the life any more.
+                                   {"state", std::to_string(R32(actor + layout::coop::kActorState))},
                                    {"seq", std::to_string(state.event_seq)}})
                        .c_str());
     return true;
@@ -427,6 +512,42 @@ bool World::ApplyEvent(const net::coop::Event& event) {
 // The guest: the actor's own tick ran, so the host's transform goes in now.
 // The tick of the guest would overwrite it otherwise (LAYOUT.md §6).
 void World::AfterActorTick(uint32_t actor) {
+    // The test harness's kill, on the engine's own thread: the damage goes
+    // through the engine's routine, so the host publishes it and the guest
+    // replays it. It is the host that kills, so it happens before the guest
+    // check below.
+    if (test_kill_actor_ && actor == test_kill_actor_) {
+        const uint32_t target = test_kill_actor_;
+        test_kill_actor_ = 0;
+        X86Context& kill_ctx = CurrentContext();
+        uint32_t scratch = Scratch();
+        float direction[4] = {0.0f, 0.0f, 1.0f, 0.0f};
+        std::memcpy(HostPtr(scratch + kScratchHit), direction, 16);
+        uint32_t event_ptr = scratch + kScratchEvent;
+        float origin[4] = {G<float>(target + layout::coop::kActorPosition),
+                           G<float>(target + layout::coop::kActorPosition + 4),
+                           G<float>(target + layout::coop::kActorPosition + 8), 0.0f};
+        std::memcpy(HostPtr(event_ptr), origin, 16);
+        float damage = 1000.0f;
+        float radius = 1.0f;
+        std::memcpy(HostPtr(event_ptr + layout::coop::kDamageEventDamage), &damage, 4);
+        std::memcpy(HostPtr(event_ptr + layout::coop::kDamageEventRadius), &radius, 4);
+        W32(event_ptr + layout::coop::kDamageEventType, 1);
+        W32(event_ptr + layout::coop::kDamageEventFlag, 0);
+        W32(event_ptr + 0x20, 0);
+        kill_ctx.ecx = target;
+        CallGuest(kill_ctx, layout::coop::kDamageMethod,
+                  {target + layout::coop::kActorPosition, scratch + kScratchHit, Bits(damage), event_ptr, Bits(radius),
+                   1, 0});
+        LOGI("%s", FormatLog("test", {{"what", "kill"},
+                                       {"reason", "applied"},
+                                       {"actor", std::to_string(target)},
+                                       {"key_a", std::to_string(test_kill_key_a_)},
+                                       {"key_b", std::to_string(test_kill_key_b_)},
+                                       {"generation", std::to_string(test_kill_generation_)}})
+                           .c_str());
+    }
+
     if (!IsGuest()) return;
 
     // the events that arrived outside the guest thread
@@ -481,16 +602,63 @@ void World::AfterActorTick(uint32_t actor) {
     if (have) WriteActorState(actor, state);
 }
 
+// The test harness: the host picks the living actor that is nearest to the
+// player and kills it, through the engine's own damage routine. The damage
+// is then published like any other damage, and the guest replays it, so the
+// death chain runs on both sides.
+bool World::ArmTestKill() {
+    if (!IsHost()) return false;
+    std::vector<uint32_t> actors;
+    EnumerateActors(&actors);
+    uint32_t best = 0;
+    uint32_t best_generation = 0xFFFFFFFF;
+    for (uint32_t actor : actors) {
+        if (R32(actor + layout::coop::kActorState) != kActorAlive) continue;
+        // An actor with a life: a prop has a life field full of rubbish.
+        const float life = G<float>(actor + layout::coop::kActorHealth);
+        if (!(life > 0.0f) || life > 1000.0f) continue;
+        // And an actor the engine gave an identity: the pair at actor+0x08
+        // and actor+0x0C is the key it matches objects with, and an actor
+        // without one is not a script object.
+        const uint32_t key_a = R32(actor + layout::coop::kActorKeyA);
+        const uint32_t key_b = R32(actor + layout::coop::kActorKeyB);
+        if (key_a == 0 && key_b == 0) continue;
+        // The oldest activation: the two copies of the level bring their
+        // actors in at their own pace, and the first ones are the ones
+        // both have.
+        const uint32_t generation = R32(actor + layout::coop::kActorGeneration);
+        if (best == 0 || generation < best_generation) {
+            best = actor;
+            best_generation = generation;
+        }
+    }
+    // The level spawns its actors while it comes up, so there may be none
+    // yet. The caller asks again later.
+    if (!best) return false;
+    test_kill_actor_ = best;
+    test_kill_key_a_ = R32(best + layout::coop::kActorKeyA);
+    test_kill_key_b_ = R32(best + layout::coop::kActorKeyB);
+    test_kill_generation_ = R32(best + layout::coop::kActorGeneration);
+    LOGI("%s", FormatLog("test", {{"what", "kill"},
+                                   {"reason", "armed"},
+                                   {"actor", std::to_string(best)},
+                                   {"key_a", std::to_string(test_kill_key_a_)},
+                                   {"key_b", std::to_string(test_kill_key_b_)},
+                                   {"generation", std::to_string(test_kill_generation_)}})
+                       .c_str());
+    return true;
+}
+
 void World::PublishDamage(const DamageCall& call) {
     if (!IsHost() || !call.actor) return;
     net::coop::Event event;
     event.state.start_epoch = epoch_;
     event.state.event_type = static_cast<uint8_t>(net::coop::EventType::ActorDamaged);
     event.state.damage_type = static_cast<uint8_t>(call.type);
-    event.state.native_a = R32(call.actor + layout::coop::kActorKeyA);
-    event.state.native_b = R32(call.actor + layout::coop::kActorKeyB);
-    event.state.generation = R32(call.actor + layout::coop::kActorGeneration);
-    event.state.object_type = static_cast<uint16_t>(R32(call.actor + layout::coop::kActorType));
+    event.state.native_a = call.native_a;
+    event.state.native_b = call.native_b;
+    event.state.generation = call.generation;
+    event.state.object_type = static_cast<uint16_t>(call.actor_type);
     event.state.value = call.damage;
     event.state.radius = call.radius;
     for (int i = 0; i < 3; i++) {
@@ -498,6 +666,7 @@ void World::PublishDamage(const DamageCall& call) {
         event.state.dir[i] = call.direction[i];
     }
     event.state.flags = static_cast<uint16_t>(call.flag);
+    event.state.hit_state = call.hit_state;
     counters_.events++;
     LOGI("%s", FormatLog("event", {{"kind", "damage"},
                                    {"actor", std::to_string(call.actor)},
@@ -541,6 +710,13 @@ void World::LogSummary() {
 namespace {
 void CaptureDamageCall(X86Context& ctx, game::coop::DamageCall* call) {
     call->actor = ctx.ecx;
+    // The identity, before the call. The death clears the pair at actor+0x08
+    // and actor+0x0C, so an event published after the call would carry an
+    // identity of zero and the guest would find nothing.
+    call->native_a = R32(ctx.ecx + layout::coop::kActorKeyA);
+    call->native_b = R32(ctx.ecx + layout::coop::kActorKeyB);
+    call->generation = R32(ctx.ecx + layout::coop::kActorGeneration);
+    call->actor_type = R32(ctx.ecx + layout::coop::kActorType);
     uint32_t direction = R32(ctx.esp + 8);
     uint32_t event = R32(ctx.esp + 16);
     call->damage = AsFloat(R32(ctx.esp + 12));
@@ -556,6 +732,14 @@ void CaptureDamageCall(X86Context& ctx, game::coop::DamageCall* call) {
         for (int i = 0; i < 3; i++) {
             call->origin[i] = G<float>(event + layout::coop::kDamageEventOrigin + i * 4);
         }
+    }
+    // The controller's hit state. The routine reads the body part and skips
+    // the damage for some of them, so the guest has to have the same one.
+    const uint32_t controller = R32(call->actor + layout::coop::kActorController);
+    if (controller) {
+        const uint32_t mode = R32(controller + 0x90);
+        const uint32_t part = R32(controller + 0xCA8);
+        call->hit_state = (mode & 0xFF) | ((part & 0xFF) << 8);
     }
 }
 }  // namespace
@@ -577,7 +761,21 @@ X86_FUNC(sub_001DF830) {
     if (world.IsHost()) {
         game::coop::DamageCall call;
         CaptureDamageCall(ctx, &call);
-        world.PublishDamage(call);
+        const float before = G<float>(call.actor + layout::coop::kActorHealth);
+        const uint32_t controller = R32(call.actor + layout::coop::kActorController);
+        const uint32_t mode = controller ? R32(controller + 0x90) : 0;
+        const uint32_t part = controller ? R32(controller + 0xCA8) : 0;
+        __imp__sub_001DF830(ctx, base);
+        const float after = G<float>(call.actor + layout::coop::kActorHealth);
+        LOGI("%s", game::coop::FormatLog("damage", {{"side", "host"},
+                                        {"actor", std::to_string(call.actor)},
+                                        {"before", game::coop::LogNumber(before)},
+                                        {"after", game::coop::LogNumber(after)},
+                                        {"mode", std::to_string(mode)},
+                                        {"part", std::to_string(part)}})
+                                   .c_str());
+        if (before != after) world.PublishDamage(call);
+        return;
     }
     __imp__sub_001DF830(ctx, base);
 }

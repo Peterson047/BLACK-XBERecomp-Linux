@@ -47,6 +47,7 @@ private:
 
     bool enabled_ = false;
     bool mission_named_ = false;
+    bool test_kill_armed_ = false;
     bool level_loaded_ = false;
     bool launch_requested_ = false;
     bool summary_logged_ = false;

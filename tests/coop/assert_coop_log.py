@@ -92,6 +92,32 @@ def main(argv):
         if log.summary() is None:
             problems.append(f"the {name} log has no 'coop: summary' line")
 
+    # The death has to have crossed. When the test harness killed an enemy
+    # on the host, the guest has to have applied the same damage to the same
+    # actor: the same key, the same generation.
+    kills = [fields for verb, fields, _raw in host.entries if verb == "test" and fields.get("what") == "kill"
+             and fields.get("reason") == "applied"]
+    if kills:
+        kill = kills[-1]
+        applied = [fields for verb, fields, _raw in guest.entries
+                   if verb == "apply" and fields.get("kind") == "damage"]
+        if not applied:
+            problems.append("the host killed an actor and the guest applied no damage")
+        else:
+            same = [a for a in applied
+                    if a.get("key_a") == kill.get("key_a") and a.get("key_b") == kill.get("key_b")
+                    and a.get("generation") == kill.get("generation")]
+            if not same:
+                problems.append(
+                    f"the guest did not apply the host's death: the host killed "
+                    f"key={kill.get('key_a')}/{kill.get('key_b')} generation={kill.get('generation')}, "
+                    f"the guest applied {[ (a.get('key_a'), a.get('key_b'), a.get('generation')) for a in applied ]}")
+            else:
+                for a in same:
+                    if a.get("state") not in (None, "1", "2"):
+                        problems.append(
+                            f"the guest's actor is still alive after the host's death: state={a.get('state')}")
+
     if problems:
         return fail("; ".join(problems))
 
@@ -175,6 +201,32 @@ def main(argv):
         if int(guest_snapshots) > int(host_snapshots):
             problems.append(
                 f"the guest received more snapshots than the host sent: host={host_snapshots} guest={guest_snapshots}")
+
+    # The death has to have crossed. When the test harness killed an enemy
+    # on the host, the guest has to have applied the same damage to the same
+    # actor: the same key, the same generation.
+    kills = [fields for verb, fields, _raw in host.entries if verb == "test" and fields.get("what") == "kill"
+             and fields.get("reason") == "applied"]
+    if kills:
+        kill = kills[-1]
+        applied = [fields for verb, fields, _raw in guest.entries
+                   if verb == "apply" and fields.get("kind") == "damage"]
+        if not applied:
+            problems.append("the host killed an actor and the guest applied no damage")
+        else:
+            same = [a for a in applied
+                    if a.get("key_a") == kill.get("key_a") and a.get("key_b") == kill.get("key_b")
+                    and a.get("generation") == kill.get("generation")]
+            if not same:
+                problems.append(
+                    f"the guest did not apply the host's death: the host killed "
+                    f"key={kill.get('key_a')}/{kill.get('key_b')} generation={kill.get('generation')}, "
+                    f"the guest applied {[ (a.get('key_a'), a.get('key_b'), a.get('generation')) for a in applied ]}")
+            else:
+                for a in same:
+                    if a.get("state") not in (None, "1", "2"):
+                        problems.append(
+                            f"the guest's actor is still alive after the host's death: state={a.get('state')}")
 
     if problems:
         return fail("; ".join(problems))

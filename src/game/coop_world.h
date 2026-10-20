@@ -56,12 +56,22 @@ enum class Role : uint8_t {
 // The damage the engine's own routine was given, as the hook caught it.
 struct DamageCall {
     uint32_t actor = 0;         // the actor the routine was called on
+    // The identity, taken before the call: the death clears the pair at
+    // actor+0x08 and actor+0x0C, so reading it afterwards finds nothing.
+    uint32_t native_a = 0;
+    uint32_t native_b = 0;
+    uint32_t generation = 0;
+    uint32_t actor_type = 0;
     float origin[3] = {0, 0, 0};    // where the hit landed, in world space
     float direction[3] = {0, 0, 0}; // where the hit came from
     float damage = 0.0f;
     float radius = 0.0f;
     uint32_t type = 0;  // 1, 2 or 3
     uint32_t flag = 0;
+    // The controller's hit state: the mode in the low byte and the body
+    // part in the next. The damage routine reads them and skips the damage
+    // for some body parts, so the guest has to have the same.
+    uint32_t hit_state = 0;
 };
 
 class World {
@@ -127,6 +137,13 @@ public:
     // coop_world.cpp hands the call over here.
     void PublishDamage(const DamageCall& call);
 
+    // The test harness: the host kills the nearest living actor, so the
+    // replication of the death can be checked without a player at the
+    // keyboard. The kill goes through the engine's own damage routine, so
+    // it is published and replayed like any other damage.
+    // It returns false when there is no living actor to kill yet.
+    bool ArmTestKill();
+
     // The guest: the actor's own tick ran. The host's transform goes in
     // now, and the events that arrived are applied.
     void AfterActorTick(uint32_t actor);
@@ -152,6 +169,10 @@ private:
     std::mutex mutex_;
     uint32_t last_unpaired_ = 0;  // what the last pairing said, to log the change
     uint32_t last_missing_ = 0;
+    uint32_t test_kill_actor_ = 0;   // the actor the test harness is going to kill
+    uint32_t test_kill_key_a_ = 0;
+    uint32_t test_kill_key_b_ = 0;
+    uint32_t test_kill_generation_ = 0;
     net::coop::Snapshot pending_snapshot_;
     bool has_pending_snapshot_ = false;
     std::vector<net::coop::Event> pending_events_;
