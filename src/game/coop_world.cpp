@@ -210,10 +210,15 @@ bool World::ApplySnapshot(const net::coop::Snapshot& snapshot) {
     std::vector<ActorIdentity> identities;
     identities.reserve(actors.size());
     for (uint32_t actor : actors) {
-        identities.push_back(ActorIdentity{R32(actor + layout::coop::kActorKeyA),
-                                           R32(actor + layout::coop::kActorKeyB),
-                                           R32(actor + layout::coop::kActorGeneration),
-                                           static_cast<uint16_t>(R32(actor + layout::coop::kActorType))});
+        ActorIdentity identity;
+        identity.native_a = R32(actor + layout::coop::kActorKeyA);
+        identity.native_b = R32(actor + layout::coop::kActorKeyB);
+        identity.generation = R32(actor + layout::coop::kActorGeneration);
+        identity.type = static_cast<uint16_t>(R32(actor + layout::coop::kActorType));
+        identity.pos[0] = G<float>(actor + layout::coop::kActorPosition);
+        identity.pos[1] = G<float>(actor + layout::coop::kActorPosition + 4);
+        identity.pos[2] = G<float>(actor + layout::coop::kActorPosition + 8);
+        identities.push_back(identity);
     }
     Pairing pairing = PairActors(identities, snapshot);
     counters_.unpaired += pairing.unpaired;
@@ -431,14 +436,38 @@ void World::AfterActorTick(uint32_t actor) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (has_pending_snapshot_) {
-            ActorIdentity identity{R32(actor + layout::coop::kActorKeyA),
-                                   R32(actor + layout::coop::kActorKeyB),
-                                   R32(actor + layout::coop::kActorGeneration),
-                                   static_cast<uint16_t>(R32(actor + layout::coop::kActorType))};
+            ActorIdentity identity;
+            identity.native_a = R32(actor + layout::coop::kActorKeyA);
+            identity.native_b = R32(actor + layout::coop::kActorKeyB);
+            identity.generation = R32(actor + layout::coop::kActorGeneration);
+            identity.type = static_cast<uint16_t>(R32(actor + layout::coop::kActorType));
+            identity.pos[0] = G<float>(actor + layout::coop::kActorPosition);
+            identity.pos[1] = G<float>(actor + layout::coop::kActorPosition + 4);
+            identity.pos[2] = G<float>(actor + layout::coop::kActorPosition + 8);
             int index = FindSnapshotActor(pending_snapshot_, identity);
             if (index >= 0) {
                 state = pending_snapshot_.actors[index];
                 have = true;
+            } else {
+                // The same script object, activated in another order on the
+                // other side: the position tells them apart.
+                const auto& actors = pending_snapshot_.actors;
+                const uint32_t count = pending_snapshot_.header.actor_count > net::coop::kMaxActorsPerSnapshot
+                                           ? net::coop::kMaxActorsPerSnapshot
+                                           : pending_snapshot_.header.actor_count;
+                float best = 0.0f;
+                for (uint32_t j = 0; j < count; j++) {
+                    if (actors[j].native_a != identity.native_a) continue;
+                    if (actors[j].native_b != identity.native_b) continue;
+                    if (actors[j].type != identity.type) continue;
+                    const float distance = Distance(identity.pos, actors[j].pos);
+                    if (!have || distance < best) {
+                        best = distance;
+                        index = static_cast<int>(j);
+                        state = actors[j];
+                        have = true;
+                    }
+                }
             }
         }
     }

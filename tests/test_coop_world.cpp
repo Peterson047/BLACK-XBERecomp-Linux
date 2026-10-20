@@ -101,16 +101,46 @@ void TestPairing() {
     // the host's third actor is not on the guest: that is counted apart
     CHECK(pairing.missing == 1);
 
-    // An actor that only shares the pair is not a match: the generation and
-    // the type are part of the identity.
+    // An actor of another type is not a match: the type is part of the
+    // identity and nothing can rescue it.
     std::vector<ActorIdentity> wrong = {
-        ActorIdentity{1, 2, 99, 1},
+        ActorIdentity{1, 2, 5, 7},
         ActorIdentity{3, 4, 6, 7},
     };
     auto unmatched = PairActors(wrong, snapshot);
     CHECK(unmatched.paired == 0);
     CHECK(unmatched.unpaired == 2);
     CHECK(unmatched.missing == 3);
+
+    // The same script object, activated in another order on the other side,
+    // is the same actor: the generation is the manager's activation counter
+    // and the two processes do not count in the same order, so the pair and
+    // the position are what is left.
+    // The snapshot's actors are all at (1, 2, 3).
+    ActorIdentity permuted{1, 2, 99, 1};
+    permuted.pos[0] = 1.0f;
+    permuted.pos[1] = 2.0f;
+    permuted.pos[2] = 3.5f;
+    ActorIdentity other{3, 4, 6, 1};
+    other.pos[0] = 1.5f;
+    other.pos[1] = 2.0f;
+    other.pos[2] = 3.0f;
+    std::vector<ActorIdentity> shifted = {permuted, other};
+    auto by_position = PairActors(shifted, snapshot);
+    CHECK(by_position.paired == 2);
+    // only the permuted one needed the second chance
+    CHECK(by_position.by_position == 1);
+    CHECK(by_position.unpaired == 0);
+
+    // The same script object, but far away: that is another actor, and the
+    // second chance does not reach it.
+    ActorIdentity far = permuted;
+    far.pos[0] = 500.0f;
+    std::vector<ActorIdentity> distant = {far};
+    auto too_far = PairActors(distant, snapshot);
+    CHECK(too_far.paired == 0);
+    CHECK(too_far.unpaired == 1);
+    CHECK(too_far.missing == 3);
 
     // An empty snapshot leaves every guest actor without a pair.
     auto empty = PairActors(guests, MakeSnapshot({}));

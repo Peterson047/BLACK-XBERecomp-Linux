@@ -36,6 +36,9 @@ struct ActorIdentity {
     uint32_t native_b = 0;    // actor+0x0C
     uint32_t generation = 0;  // actor+0x374
     uint16_t type = 0;        // actor+0xC4
+    // Where the actor is, so a second chance can be made when the
+    // generations do not line up.
+    float pos[3] = {0.0f, 0.0f, 0.0f};
 
     bool operator==(const ActorIdentity& other) const {
         return native_a == other.native_a && native_b == other.native_b && generation == other.generation &&
@@ -46,7 +49,28 @@ struct ActorIdentity {
 
 // The identity of an actor of a snapshot.
 inline ActorIdentity IdentityOf(const net::coop::ActorState& state) {
-    return ActorIdentity{state.native_a, state.native_b, state.generation, state.type};
+    ActorIdentity identity;
+    identity.native_a = state.native_a;
+    identity.native_b = state.native_b;
+    identity.generation = state.generation;
+    identity.type = state.type;
+    identity.pos[0] = state.pos[0];
+    identity.pos[1] = state.pos[1];
+    identity.pos[2] = state.pos[2];
+    return identity;
+}
+
+// How far apart two actors of the same script object may be and still be
+// taken for the same actor. The two copies of the level are a hundred
+// milliseconds apart, so a few metres is the order of the difference.
+constexpr float kPairDistance = 16.0f;  // the square of four metres
+
+// The distance between two positions.
+inline float Distance(const float* a, const float* b) {
+    const float dx = a[0] - b[0];
+    const float dy = a[1] - b[1];
+    const float dz = a[2] - b[2];
+    return dx * dx + dy * dy + dz * dz;
 }
 
 // The index of the actor of the snapshot with this identity, or -1.
@@ -72,24 +96,67 @@ inline int FindSnapshotActor(const net::coop::Snapshot& snapshot, const ActorIde
 struct Pairing {
     std::vector<int> guest_to_snapshot;  // one entry per guest actor
     uint32_t paired = 0;
-    uint32_t unpaired = 0;  // the guest actors that matched nothing
-    uint32_t missing = 0;   // the snapshot actors the guest does not have
+    uint32_t unpaired = 0;      // the guest actors that matched nothing
+    uint32_t missing = 0;       // the snapshot actors the guest does not have
+    uint32_t by_position = 0;   // the ones that matched by position, not by generation
 };
 
 inline Pairing PairActors(const std::vector<ActorIdentity>& guests, const net::coop::Snapshot& snapshot) {
     Pairing pairing;
     pairing.guest_to_snapshot.reserve(guests.size());
-    for (const ActorIdentity& guest : guests) {
-        int index = FindSnapshotActor(snapshot, guest);
-        pairing.guest_to_snapshot.push_back(index);
-        if (index >= 0) {
-            pairing.paired++;
-        } else {
-            pairing.unpaired++;
-        }
-    }
+    pairing.guest_to_snapshot.assign(guests.size(), -1);
+
+    // The first chance is the whole identity, generation included.
     uint32_t count = snapshot.header.actor_count;
     if (count > net::coop::kMaxActorsPerSnapshot) count = net::coop::kMaxActorsPerSnapshot;
+    std::vector<bool> taken(count, false);
+    for (size_t i = 0; i < guests.size(); i++) {
+        const int index = FindSnapshotActor(snapshot, guests[i]);
+        if (index < 0 || taken[static_cast<size_t>(index)]) continue;
+        pairing.guest_to_snapshot[i] = index;
+        taken[static_cast<size_t>(index)] = true;
+        pairing.paired++;
+    }
+
+    // The second chance is the script object alone, matched by where the
+    // actor is.
+    //
+    // The generation is the manager's activation counter, and the two
+    // processes do not activate the same objects in the same order: the
+    // level script reacts to where the player is, and the two players are
+    // in different places. The counter is then permuted between them and
+    // the whole identity does not line up, even though it is the same
+    // actor. The pair at actor+0x08 / actor+0x0C is the engine's own key
+    // for the script object, and it does line up; the position tells the
+    // two activations of the same object apart.
+    for (size_t i = 0; i < guests.size(); i++) {
+        if (pairing.guest_to_snapshot[i] >= 0) continue;
+        int best = -1;
+        float best_distance = 0.0f;
+        for (uint32_t j = 0; j < count; j++) {
+            if (taken[j]) continue;
+            const net::coop::ActorState& candidate = snapshot.actors[j];
+            if (candidate.native_a != guests[i].native_a) continue;
+            if (candidate.native_b != guests[i].native_b) continue;
+            if (candidate.type != guests[i].type) continue;
+            const float distance = Distance(guests[i].pos, candidate.pos);
+            if (distance > kPairDistance) continue;
+            if (best < 0 || distance < best_distance) {
+                best = static_cast<int>(j);
+                best_distance = distance;
+            }
+        }
+        if (best >= 0) {
+            pairing.guest_to_snapshot[i] = best;
+            taken[static_cast<size_t>(best)] = true;
+            pairing.paired++;
+            pairing.by_position++;
+        }
+    }
+
+    for (size_t i = 0; i < guests.size(); i++) {
+        if (pairing.guest_to_snapshot[i] < 0) pairing.unpaired++;
+    }
     pairing.missing = count - pairing.paired;
     return pairing;
 }
