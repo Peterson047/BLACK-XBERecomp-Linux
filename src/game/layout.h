@@ -163,6 +163,7 @@ constexpr uint32_t kFireEvent = 0x0012B8E0;    // the level script fires a named
 constexpr uint32_t kQueueEvent = 0x0012B790;   // the bus takes an event
 constexpr uint32_t kUseRequest = 0x001BAA40;   // the "use" of an object is registered
 constexpr uint32_t kFrameTick = 0x000BE550;    // the frame counter
+constexpr uint32_t kFrameCount = 0x2F4368;     // the number of the frames that went
 
 }  // namespace coop
 

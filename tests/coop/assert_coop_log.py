@@ -63,6 +63,11 @@ class Log:
         return found
 
 
+def is_host(log):
+    """The host says it started a server; the guest says it sent a join."""
+    return "Server started on port" in log.path.read_text(errors="replace")
+
+
 def fail(message):
     print(f"COOP LOG CHECK FAILED: {message}")
     return 1
@@ -108,11 +113,22 @@ def main(argv):
             elif value not in ("0",):
                 problems.append(f"the {name} summary reports {counter}={value}")
 
-    # An actor that never found its pair is a silent divergence.
+    # An actor without a pair is a silent divergence.
+    #
+    # The count of the lines is not the gate: while the two copies of the
+    # level load, one side has an actor the other does not have yet, and the
+    # count goes up and down on its own. What matters is where it ended up:
+    # the summary says how many are unpaired now, and the last pairing says
+    # how the two sides line up at the end.
     for name, log in (("host", host), ("guest", guest)):
-        unpaired = log.verbs("unpaired")
-        if unpaired:
-            problems.append(f"the {name} reported {len(unpaired)} unpaired actors")
+        pairs = log.verbs("pair")
+        if not pairs:
+            continue
+        last = pairs[-1]
+        for key in ("unpaired", "missing"):
+            value = last.get(key)
+            if value is not None and value != "0":
+                problems.append(f"the {name} ended with {key}={value}")
 
     # The errors the co-op code reported itself.
     for name, log in (("host", host), ("guest", guest)):
@@ -120,11 +136,15 @@ def main(argv):
         if errors:
             problems.append(f"the {name} reported {len(errors)} co-op errors: {errors[0]}")
 
-    # The guest is never a source: it must not publish events.
+    # The guest is never a source: it must not publish events. The host
+    # publishes, and its log says so.
     for name, log in (("host", host), ("guest", guest)):
         published = log.verbs("publish")
-        if published:
-            problems.append(f"the {name} published {len(published)} events; the guest is never a source")
+        if not published:
+            continue
+        if is_host(log):
+            continue
+        problems.append(f"the {name} published {len(published)} events; the guest is never a source")
 
     # The sequences the guest applied have to be strictly increasing.
     sequences = []
@@ -139,13 +159,22 @@ def main(argv):
             problems.append(f"the guest applied the sequences out of order: {before} then {after}")
             break
 
-    # The counters of the two sides have to agree.
-    for counter in ("snapshots", "events"):
-        host_value = host_summary.get(counter)
-        guest_value = guest_summary.get(counter)
-        if host_value is not None and guest_value is not None and host_value != guest_value:
+    # The events the two sides handled have to be the same number.
+    #
+    # The snapshots are not: the host starts publishing before the guest
+    # arrives, so the host has sent more than the guest has received. The
+    # guest must not have received more than the host sent.
+    host_value = host_summary.get("events")
+    guest_value = guest_summary.get("events")
+    if host_value is not None and guest_value is not None and host_value != guest_value:
+        problems.append(f"the two sides disagree about 'events': host={host_value} guest={guest_value}")
+
+    host_snapshots = host_summary.get("snapshots")
+    guest_snapshots = guest_summary.get("snapshots")
+    if host_snapshots is not None and guest_snapshots is not None:
+        if int(guest_snapshots) > int(host_snapshots):
             problems.append(
-                f"the two sides disagree about '{counter}': host={host_value} guest={guest_value}")
+                f"the guest received more snapshots than the host sent: host={host_snapshots} guest={guest_snapshots}")
 
     if problems:
         return fail("; ".join(problems))

@@ -14,6 +14,7 @@ CHECKER = HERE / "assert_coop_log.py"
 
 GOOD_HOST = """\
 coop: snapshot epoch=1 actors=9
+coop: pair epoch=1 paired=9 unpaired=0 missing=0
 coop: event epoch=1 seq=1 type=ActorDamaged
 coop: summary epoch=1 snapshots=100 events=42 unpaired=0 divergent=0
 """
@@ -22,6 +23,7 @@ GOOD_GUEST = """\
 coop: snapshot epoch=1 actors=9
 coop: apply epoch=1 seq=1
 coop: apply epoch=1 seq=2
+coop: pair epoch=1 paired=9 unpaired=0 missing=0
 coop: summary epoch=1 snapshots=100 events=42 unpaired=0 divergent=0
 """
 
@@ -47,6 +49,10 @@ CASES = [
     ("different rounds fail", GOOD_HOST,
      GOOD_GUEST.replace("epoch=1", "epoch=2"), 1),
     ("an unpaired actor fails", GOOD_HOST.replace("unpaired=0", "unpaired=3"), GOOD_GUEST, 1),
+    ("a pairing that ends short fails", GOOD_HOST.replace("paired=9 unpaired=0 missing=0",
+                                                          "paired=6 unpaired=3 missing=3"), GOOD_GUEST, 1),
+    ("a pairing that ends missing fails", GOOD_HOST.replace("paired=9 unpaired=0 missing=0",
+                                                             "paired=9 unpaired=0 missing=1"), GOOD_GUEST, 1),
     ("a divergence fails", GOOD_HOST.replace("divergent=0", "divergent=1"), GOOD_GUEST, 1),
     ("a co-op error fails", GOOD_HOST + "coop: error what=something\n", GOOD_GUEST, 1),
     ("out of order sequences fail", GOOD_GUEST,

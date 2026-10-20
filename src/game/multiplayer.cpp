@@ -1,4 +1,6 @@
 #include "game/coop_adapter.h"
+#include "game/coop_mission.h"
+#include "game/coop_world.h"
 #include "game/multiplayer.h"
 #include "game/layout.h"
 #include "common/aspect.h"
@@ -818,6 +820,44 @@ void MultiplayerManager::DrawImGuiMenu() {
             if (ImGui::Button("Disconnect", ImVec2(220, 32))) {
                 net.Disconnect();
             }
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextColored(ImVec4(0.86f, 0.69f, 0.34f, 1.0f), "CO-OP");
+
+    auto& coop = coop::Adapter::Get();
+    if (!coop.IsEnabled()) {
+        ImGui::TextDisabled("The co-op is the campaign with a partner. It is a session of its own.");
+        if (ImGui::Button("Start Co-op Session", ImVec2(220, 32))) {
+            coop.Enable();
+        }
+    } else {
+        auto& session = coop.Session();
+        const char* phase = "Idle";
+        switch (session.GetPhase()) {
+            case net::coop::Phase::Idle: phase = "Idle"; break;
+            case net::coop::Phase::Lobby: phase = "Lobby"; break;
+            case net::coop::Phase::Loading: phase = "Loading"; break;
+            case net::coop::Phase::InMission: phase = "In mission"; break;
+            case net::coop::Phase::Ended: phase = "Ended"; break;
+        }
+        ImGui::Text("Session: %s   Round: %u", phase, session.GetStartEpoch());
+        const auto& objectives = coop::Mission::Get().ReadObjectives();
+        ImGui::Text("Objectives: %u of %u done", objectives.done, objectives.count);
+        ImGui::Text("Actors without a pair: %u   Divergences: %u", coop::World::Get().UnpairedCount(),
+                    coop::World::Get().DivergentCount());
+        if (net.GetMode() == net::NetMode::Host) {
+            if (session.GetPhase() == net::coop::Phase::Lobby) {
+                if (ImGui::Button("Start Co-op Mission", ImVec2(220, 32))) {
+                    coop.StartMission();
+                }
+            } else {
+                ImGui::TextDisabled("The mission is running.");
+            }
+        } else if (net.GetMode() == net::NetMode::Client) {
+            ImGui::TextDisabled("Waiting for the host to start the mission.");
         }
     }
 

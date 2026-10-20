@@ -130,7 +130,9 @@ public:
     void OnNamedEvent(const NamedEvent& event);
 
     // The host: the engine registered an interaction, the "use" of an object.
-    void OnInteraction(uint16_t object_type, const float pos[3], float radius);
+    // The object is the one the engine used; it is a runtime object of this
+    // process, so only its type crosses the network.
+    void OnInteraction(uint32_t object, uint16_t object_type, const float pos[3], float radius);
 
     // The engine's calls into the mission layer. The hooks of the mission
     // call these; nothing else does.
@@ -164,6 +166,12 @@ public:
     // on the guest thread, once a frame.
     void Pump();
 
+    // The guest: the events of the host that arrived, applied in the guest's
+    // own bus. It has to run on the thread that runs the engine: the call
+    // into the engine is not safe anywhere else. When there is no such
+    // thread, the events wait for one.
+    void ApplyPending();
+
     // The counters of the session.
     uint32_t Events() const { return events_; }
     uint32_t Unpaired() const { return unpaired_; }
@@ -184,6 +192,13 @@ private:
 
     // The guest fires the event of the host in its own bus.
     void FireLocal(const NamedEvent& event);
+
+    // The key of an event: the name, the text and the count. Two events with
+    // the same key are the same event.
+    static std::string EventKey(const NamedEvent& event);
+
+    // True when the guest's own engine already fired this event.
+    bool HasTwin(const NamedEvent& event);
 
     // The two sides do not agree about the state of the mission. The same
     // divergence is only counted and logged once.
@@ -209,6 +224,10 @@ private:
     bool divergence_logged_ = false;  // the last divergence was already logged
     uint32_t divergence_count_ = 0;   // the state of the host in that divergence
     uint32_t divergence_done_ = 0;
+    uint32_t last_object_ = 0;        // the last object the player used
+    uint32_t last_interaction_frame_ = 0;
+    uint32_t last_world_ = 0;         // the world of the last reading
+    bool objective_logged_ = false;   // the state of the mission was already logged
     uint32_t sequence_ = 0;   // the number of the events that went to the network
     uint32_t published_count_ = 0;  // the last state of the mission the host published
     uint32_t published_done_ = 0;
@@ -216,6 +235,10 @@ private:
     std::mutex mutex_;
     std::deque<net::coop::Event> outbox_;  // the events the host has to publish
     std::deque<net::coop::Event> inbox_;   // the events the guest has to apply
+    // The events the guest's own engine fired, in order. The event of the
+    // host that has a twin in here is the one the guest already had: it is
+    // not fired again, or the objective would be counted twice.
+    std::deque<std::string> local_events_;
 };
 }  // namespace coop
 }  // namespace game

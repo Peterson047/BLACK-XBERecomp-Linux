@@ -221,20 +221,27 @@ bool World::ApplySnapshot(const net::coop::Snapshot& snapshot) {
         identities.push_back(identity);
     }
     Pairing pairing = PairActors(identities, snapshot);
-    counters_.unpaired += pairing.unpaired;
+    // The counter is the state of this frame, not a running total: the gate
+    // reads it to know whether the two sides agree right now.
+    counters_.unpaired = pairing.unpaired;
     counters_.snapshots++;
     LOGI("%s", FormatLog("pair", {{"epoch", std::to_string(epoch_)},
                                    {"paired", std::to_string(pairing.paired)},
                                    {"unpaired", std::to_string(pairing.unpaired)},
                                    {"missing", std::to_string(pairing.missing)}})
                        .c_str());
-    if (pairing.unpaired) {
+    // The two lines say when the pairing changed, not every frame: a log
+    // that says the same thing a hundred times hides the one time it
+    // changes, and the gate reads this log.
+    if (pairing.unpaired != last_unpaired_) {
+        last_unpaired_ = pairing.unpaired;
         LOGI("%s", FormatLog("unpaired", {{"side", "guest"},
                                           {"count", std::to_string(pairing.unpaired)},
                                           {"epoch", std::to_string(epoch_)}})
                            .c_str());
     }
-    if (pairing.missing) {
+    if (pairing.missing != last_missing_) {
+        last_missing_ = pairing.missing;
         LOGI("%s", FormatLog("unpaired", {{"side", "host"},
                                           {"count", std::to_string(pairing.missing)},
                                           {"epoch", std::to_string(epoch_)}})

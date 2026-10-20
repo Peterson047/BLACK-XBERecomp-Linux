@@ -53,10 +53,6 @@ std::string Safe(const char* text, size_t max) {
     return out;
 }
 
-// The context of the guest thread, for the calls the mission makes into the
-// engine. The frame tick sets it before it pumps the mission.
-X86Context* g_context = nullptr;
-
 // The bus of this process, the one the engine's own events go to.
 uint32_t g_bus = 0;
 
@@ -114,11 +110,26 @@ void Mission::OnBusEvent(uint32_t bus, const char* name, const char* text, const
     event.pos[2] = pos[2];
     event.event_id = NameHash(event.name, std::strlen(event.name));
 
-    if (!host_) return;  // the guest never publishes anything
+    if (!host_) {
+        // The guest's own engine fired the event: it happens here as the
+        // engine means it to. The event is remembered so that the copy of
+        // the host is not fired a second time: the two would count the same
+        // objective twice.
+        std::lock_guard<std::mutex> lock(mutex_);
+        local_events_.push_back(EventKey(event));
+        while (local_events_.size() > 256) local_events_.pop_front();
+        return;
+    }
 
-    LOGI("coop: event id=%u kind=%u name=%s count=%u pos=%g,%g,%g", event.event_id, event.kind,
+    LOGI("coop: event epoch=%u id=%u kind=%u name=%s count=%u pos=%g,%g,%g", epoch_, event.event_id, event.kind,
          Safe(event.name, sizeof(event.name)).c_str(), event.count, event.pos[0], event.pos[1], event.pos[2]);
     OnNamedEvent(event);
+}
+
+std::string Mission::EventKey(const NamedEvent& event) {
+    char key[224];
+    std::snprintf(key, sizeof(key), "%s|%s|%u", event.name, event.text, event.count);
+    return key;
 }
 
 void Mission::OnNamedEvent(const NamedEvent& event) {
@@ -139,7 +150,7 @@ void Mission::OnNamedEvent(const NamedEvent& event) {
     if (outbox_.size() >= 64) {
         // The network is not draining: the event is lost and the two sides
         // will show it in the divergence.
-        LOGE("coop: error what=outbox_full kind=%s", Safe(event.name, sizeof(event.name)).c_str());
+        LOGE("coop: error epoch=%u what=outbox_full kind=%s", epoch_, Safe(event.name, sizeof(event.name)).c_str());
         unpaired_++;
         return;
     }
@@ -147,9 +158,18 @@ void Mission::OnNamedEvent(const NamedEvent& event) {
     events_++;
 }
 
-void Mission::OnInteraction(uint16_t object_type, const float pos[3], float radius) {
+void Mission::OnInteraction(uint32_t object, uint16_t object_type, const float pos[3], float radius) {
     if (!host_) return;
-    LOGI("coop: interaction type=%u pos=%g,%g,%g radius=%g", object_type, pos[0], pos[1], pos[2], radius);
+    // The engine registers the request of use again and again while the
+    // player holds the button, so the same object only goes to the network
+    // once: when another object is used, or when a second went by.
+    uint32_t frames = R32(kFrameCount);
+    if (object == last_object_ && frames - last_interaction_frame_ < 60) return;
+    last_object_ = object;
+    last_interaction_frame_ = frames;
+
+    LOGI("coop: interaction epoch=%u type=%u pos=%g,%g,%g radius=%g", epoch_, object_type, pos[0], pos[1], pos[2],
+         radius);
 
     net::coop::Event wire{};
     wire.state.event_type = uint8_t(net::coop::EventType::ObjectInteracted);
@@ -161,7 +181,7 @@ void Mission::OnInteraction(uint16_t object_type, const float pos[3], float radi
 
     std::lock_guard<std::mutex> lock(mutex_);
     if (outbox_.size() >= 64) {
-        LOGE("coop: error what=outbox_full kind=interaction");
+        LOGE("coop: error epoch=%u what=outbox_full kind=interaction", epoch_);
         unpaired_++;
         return;
     }
@@ -172,7 +192,7 @@ void Mission::OnMissionEnded() {
     if (!host_ || ended_) return;
     ended_ = true;
     ObjectiveState state = ReadObjectives();
-    LOGI("coop: mission state=ended objectives=%u done=%u", state.count, state.done);
+    LOGI("coop: mission epoch=%u state=ended objectives=%u done=%u", epoch_, state.count, state.done);
 
     net::coop::Event wire{};
     wire.state.event_type = uint8_t(net::coop::EventType::MissionEnded);
@@ -187,7 +207,7 @@ void Mission::OnMissionEnded() {
 void Mission::ApplyEvent(const net::coop::Event& event) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (inbox_.size() >= 64) {
-        LOGE("coop: error what=inbox_full type=%u", event.state.event_type);
+        LOGE("coop: error epoch=%u what=inbox_full type=%u", epoch_, event.state.event_type);
         unpaired_++;
         return;
     }
@@ -243,6 +263,10 @@ bool Mission::CompareState() {
         done = remote_done_;
     }
     if (!has) return true;
+    // The table of the objectives is only there once the level is loaded, and
+    // the host's table is there before the guest's is: the two are only
+    // compared when this process has its own table.
+    if (!state.count) return true;
     if (count == state.count && done == state.done) return true;
 
     NoteDivergence(count, done, state);
@@ -257,11 +281,15 @@ void Mission::NoteDivergence(uint32_t host_count, uint32_t host_done, const Obje
     divergence_count_ = host_count;
     divergence_done_ = host_done;
     divergent_++;
-    LOGE("coop: divergence what=objectives host=%u guest=%u objectives=%u done=%u", host_done, local.done,
+    LOGE("coop: divergence epoch=%u what=objectives host=%u guest=%u objectives=%u done=%u", epoch_, host_done, local.done,
          local.count, local.done);
 }
 
-void Mission::Pump() {
+void Mission::ApplyPending() {
+    // The call into the engine is only safe on the thread that runs the
+    // guest. On any other thread the events wait for one.
+    if (!Current()) return;
+
     // What the host sent, applied here.
     for (;;) {
         net::coop::Event event;
@@ -282,9 +310,16 @@ void Mission::Pump() {
                 named.pos[2] = event.state.pos[2];
                 std::snprintf(named.name, sizeof(named.name), "%s", event.state.text[0]);
                 std::snprintf(named.text, sizeof(named.text), "%s", event.state.text[1]);
-                LOGI("coop: event id=%u kind=%u name=%s count=%u pos=%g,%g,%g", named.event_id, named.kind,
-                     Safe(named.name, sizeof(named.name)).c_str(), named.count, named.pos[0], named.pos[1],
-                     named.pos[2]);
+                if (HasTwin(named)) {
+                    // The guest's own engine already fired this event: the
+                    // copy of the host would count the same objective twice.
+                    LOGI("coop: event epoch=%u id=%u kind=%u name=%s count=%u replayed=0", epoch_, named.event_id,
+                         named.kind, Safe(named.name, sizeof(named.name)).c_str(), named.count);
+                    break;
+                }
+                LOGI("coop: event epoch=%u id=%u kind=%u name=%s count=%u pos=%g,%g,%g replayed=1", epoch_,
+                     named.event_id, named.kind, Safe(named.name, sizeof(named.name)).c_str(), named.count,
+                     named.pos[0], named.pos[1], named.pos[2]);
                 FireLocal(named);
                 events_++;
                 break;
@@ -295,7 +330,7 @@ void Mission::Pump() {
                 break;
             case net::coop::EventType::MissionEnded:
                 ended_ = true;
-                LOGI("coop: mission state=ended objectives=%u done=%u", event.state.extra,
+                LOGI("coop: mission epoch=%u state=ended objectives=%u done=%u", epoch_, event.state.extra,
                      uint32_t(event.state.value));
                 LogSummaryOnce();
                 break;
@@ -303,15 +338,18 @@ void Mission::Pump() {
                 // The use of an object changes the world, not the mission: the
                 // world layer has the state of the object. What the mission
                 // sees of it is the named event the use fires.
-                LOGI("coop: interaction type=%u pos=%g,%g,%g radius=%g", event.state.object_type,
+                LOGI("coop: interaction epoch=%u type=%u pos=%g,%g,%g radius=%g", epoch_, event.state.object_type,
                      event.state.pos[0], event.state.pos[1], event.state.pos[2], event.state.radius);
                 break;
             default:
                 break;
         }
     }
+}
 
-    // The state of the mission, and the end of it.
+void Mission::Pump() {
+    // The state of the mission, and the end of it. This is the bookkeeping of
+    // the session: it touches no engine memory, so it can run on any thread.
     ObjectiveState state = ReadObjectives();
     if (!state.count) return;
 
@@ -324,25 +362,47 @@ void Mission::Pump() {
         remote_count = remote_count_;
         remote_done = remote_done_;
     }
-    if (has_remote && (remote_count != state.count || remote_done != state.done)) {
+    if (state.count && has_remote && (remote_count != state.count || remote_done != state.done)) {
         NoteDivergence(remote_count, remote_done, state);
     }
 
     if (!host_) return;
-    if (published_count_ != state.count || published_done_ != state.done) {
+    // A new level is a new table: the state of the mission is logged again.
+    uint32_t world = R32(layout::kWorld);
+    if (world != last_world_) {
+        last_world_ = world;
+        objective_logged_ = false;
+    }
+    bool changed = published_count_ != state.count || published_done_ != state.done;
+    if (!objective_logged_ || changed) {
+        objective_logged_ = true;
         published_count_ = state.count;
         published_done_ = state.done;
-        LOGI("coop: objective count=%u done=%u complete=%u c0=%u c1=%u c2=%u c3=%u c4=%u c5=%u", state.count, state.done,
-             state.complete, state.counters[0], state.counters[1], state.counters[2], state.counters[3],
-             state.counters[4], state.counters[5]);
-        net::coop::Event wire{};
-        wire.state.event_type = uint8_t(net::coop::EventType::ObjectiveChanged);
-        wire.state.value = float(state.done);
-        wire.state.extra = state.count;
-        std::lock_guard<std::mutex> lock(mutex_);
-        outbox_.push_back(wire);
+        LOGI("coop: objective epoch=%u count=%u done=%u complete=%u c0=%u c1=%u c2=%u c3=%u c4=%u c5=%u", epoch_,
+             state.count, state.done, state.complete, state.counters[0], state.counters[1], state.counters[2],
+             state.counters[3], state.counters[4], state.counters[5]);
+        if (changed && state.count) {
+            net::coop::Event wire{};
+            wire.state.event_type = uint8_t(net::coop::EventType::ObjectiveChanged);
+            wire.state.value = float(state.done);
+            wire.state.extra = state.count;
+            std::lock_guard<std::mutex> lock(mutex_);
+            outbox_.push_back(wire);
+        }
     }
     if (!ended_ && MissionFinished(state)) OnMissionEnded();
+}
+
+bool Mission::HasTwin(const NamedEvent& event) {
+    // The guest's own engine fires the same events as the host's, one frame
+    // or two earlier. The copy of the host that has a twin here is not fired
+    // again: the objective would be counted twice.
+    const std::string key = EventKey(event);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (local_events_.empty()) return false;
+    if (local_events_.front() != key) return false;
+    local_events_.pop_front();
+    return true;
 }
 
 void Mission::FireLocal(const NamedEvent& event) {
@@ -358,12 +418,7 @@ void Mission::FireLocal(const NamedEvent& event) {
     // is what the bus takes, and that is what is replicated.
     uint32_t bus = g_bus ? g_bus : R32(kEventBus);
     if (!bus) {
-        LOGE("coop: error what=no_bus");
-        unpaired_++;
-        return;
-    }
-    if (!g_context) {
-        LOGE("coop: error what=no_context");
+        LOGE("coop: error epoch=%u what=no_bus", epoch_);
         unpaired_++;
         return;
     }
@@ -374,7 +429,7 @@ void Mission::FireLocal(const NamedEvent& event) {
     constexpr uint32_t kTextBytes = 128;
     uint32_t block = mem::AllocSystem(kNameBytes + kTextBytes + 16, 16);
     if (!block) {
-        LOGE("coop: error what=no_memory");
+        LOGE("coop: error epoch=%u what=no_memory", epoch_);
         unpaired_++;
         return;
     }
@@ -388,9 +443,12 @@ void Mission::FireLocal(const NamedEvent& event) {
     std::memcpy(HostPtr(pos), event.pos, sizeof(event.pos));
     std::memset(static_cast<uint8_t*>(HostPtr(pos)) + sizeof(event.pos), 0, 4);
 
+    // The call into the engine has to happen on the thread that runs the
+    // guest, the same way the world layer does it.
+    X86Context& ctx = CurrentContext();
     replaying_ = true;
-    g_context->eax = bus;
-    CallGuest(*g_context, kQueueEvent, {name, text, pos, event.count});
+    ctx.eax = bus;
+    CallGuest(ctx, kQueueEvent, {name, text, pos, event.count});
     replaying_ = false;
 }
 
@@ -441,17 +499,11 @@ X86_FUNC(sub_0012B790) {
 
     Mission::Get().OnBusEvent(bus, name_text, body_text, where, count);
 
-    // The guest is not the source: its own events do not happen here. The
-    // events of the host do, and they are the ones that move the mission.
-    if (!Mission::Get().IsHost() && Mission::Get().Epoch() != 0 && !Mission::Get().IsReplaying()) {
-        // The routine pops its four arguments and returns: the frame it made
-        // is given back and the return address is gone.
-        uint32_t frame = ctx.ebp;
-        ctx.ebp = R32(frame);
-        ctx.esp = frame + 24;
-        ctx.eax = bus;
-        return;
-    }
+    // The guest is not the source: it never publishes anything of its own.
+    // Its own events do happen, though: the engine's own logic expects them,
+    // and dropping them leaves the mission of the guest in a state the engine
+    // does not expect. The copy of the host is only fired when the guest did
+    // not have the event by itself.
     __imp__sub_0012B790(ctx, base);
 }
 
@@ -481,7 +533,16 @@ X86_FUNC(sub_001BAA40) {
             break;
         }
     }
-    Mission::Get().OnInteraction(type, where, 0.0f);
+    Mission::Get().OnInteraction(object, type, where, 0.0f);
+}
+
+// The consumer of the bus: the tick of the mission. It runs on the thread
+// that runs the guest, so the events of the host are applied here, before the
+// engine reads the bus.
+X86_EXTERN_FUNC(__imp__sub_001337C0);
+X86_FUNC(sub_001337C0) {
+    Mission::Get().ApplyPending();
+    __imp__sub_001337C0(ctx, base);
 }
 
 // Once a frame: the mission applies what the host sent and watches the end of
@@ -489,7 +550,6 @@ X86_FUNC(sub_001BAA40) {
 X86_EXTERN_FUNC(__imp__sub_000BE550);
 X86_FUNC(sub_000BE550) {
     __imp__sub_000BE550(ctx, base);
-    g_context = &ctx;
     Mission::Get().Pump();
 }
 

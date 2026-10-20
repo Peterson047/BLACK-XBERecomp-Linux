@@ -28,6 +28,10 @@ public:
     // load barrier and the end of the mission.
     void Tick(float dt);
 
+    // The host names the mission. The menu calls it; the tick calls it when
+    // a partner shows up and nobody has named it yet.
+    void StartMission();
+
     // The mission ended, or the session is over: the summary goes to the log
     // so the gate can read it.
     void LogSummary();

@@ -88,6 +88,14 @@ bool Adapter::LevelLoaded() const {
     return Mission::Get().ReadObjectives().count > 0;
 }
 
+void Adapter::StartMission() {
+    if (!enabled_) return;
+    if (!World::Get().IsHost()) return;
+    if (mission_named_) return;
+    mission_named_ = true;
+    session_.HostStartMission(0);
+}
+
 void Adapter::Tick(float dt) {
     if (!enabled_) return;
 
@@ -100,8 +108,7 @@ void Adapter::Tick(float dt) {
             // The mission is named when there is somebody to name it for: the
             // two copies of the level have to start loading at the same time,
             // or their scripts begin seconds apart.
-            mission_named_ = true;
-            session_.HostStartMission(0);
+            StartMission();
         }
         OnRoomPhase(session_.GetPhase());
     } else {

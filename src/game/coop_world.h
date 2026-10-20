@@ -150,6 +150,8 @@ private:
     EventOrder order_;
 
     std::mutex mutex_;
+    uint32_t last_unpaired_ = 0;  // what the last pairing said, to log the change
+    uint32_t last_missing_ = 0;
     net::coop::Snapshot pending_snapshot_;
     bool has_pending_snapshot_ = false;
     std::vector<net::coop::Event> pending_events_;
