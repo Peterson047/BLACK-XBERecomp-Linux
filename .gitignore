@@ -33,3 +33,6 @@ black.toml
 # python bytecode
 __pycache__/
 *.pyc
+
+# the native adversarial harness is rebuilt by the test suite
+/tests/test_adversarial_redirection
