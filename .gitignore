@@ -30,3 +30,6 @@ black.toml
 # Agent Assets
 .agents/
 .specify/
+# python bytecode
+__pycache__/
+*.pyc
