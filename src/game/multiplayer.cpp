@@ -595,6 +595,13 @@ void MultiplayerManager::DrawImGuiHUD() {
     ImDrawList* draw = ImGui::GetBackgroundDrawList();
     if (!draw) return;
 
+    // The co-op has its own panel: the partner, the mission and the state of
+    // the two copies of the world. The Deathmatch panel is for the Deathmatch.
+    if (coop::Adapter::Get().IsEnabled()) {
+        DrawCoopHUD(draw);
+        return;
+    }
+
     ImGuiIO& io = ImGui::GetIO();
     auto players = net::NetworkManager::Get().GetPlayers();
     uint8_t my_id = net::NetworkManager::Get().GetLocalPlayerId();
@@ -767,6 +774,54 @@ void MultiplayerManager::DrawImGuiHUD() {
         std::snprintf(status_line, sizeof(status_line), "CONNECTED | PING: %.0f ms", ping);
     }
     draw->AddText(ImVec2(20.0f, io.DisplaySize.y - 30.0f), IM_COL32(80, 255, 80, 230), status_line);
+}
+
+// The co-op panel: the partner, the mission, and whether the two copies of
+// the world still agree.
+void MultiplayerManager::DrawCoopHUD(void* draw_list) {
+    auto* draw = static_cast<ImDrawList*>(draw_list);
+    if (!draw) return;
+    ImGuiIO& io = ImGui::GetIO();
+    auto& session = coop::Adapter::Get().Session();
+    auto& world = coop::World::Get();
+    auto& mission = coop::Mission::Get();
+
+    const auto& objectives = mission.ReadObjectives();
+    const char* phase = "Idle";
+    switch (session.GetPhase()) {
+        case net::coop::Phase::Idle: phase = "Idle"; break;
+        case net::coop::Phase::Lobby: phase = "Lobby"; break;
+        case net::coop::Phase::Loading: phase = "Loading"; break;
+        case net::coop::Phase::InMission: phase = "In mission"; break;
+        case net::coop::Phase::Ended: phase = "Ended"; break;
+    }
+
+    // The partner: the other player of the session.
+    float partner_y = io.DisplaySize.y * 0.5f - 90.0f;
+    for (const auto& pl : net::NetworkManager::Get().GetPlayers()) {
+        if (pl.id == net::NetworkManager::Get().GetLocalPlayerId() || !pl.active) continue;
+        char line[128];
+        std::snprintf(line, sizeof(line), "PARTNER  %s   %.0f HP", pl.name.c_str(), pl.state.health);
+        draw->AddText(ImVec2(20.0f, partner_y), IM_COL32(120, 200, 255, 230), line);
+        partner_y += 20.0f;
+    }
+
+    // The mission and the state of the two copies of the world.
+    char mission_line[160];
+    std::snprintf(mission_line, sizeof(mission_line), "CO-OP  %s   ROUND %u   OBJECTIVES %u/%u", phase,
+                  session.GetStartEpoch(), objectives.done, objectives.count);
+    draw->AddText(ImVec2(20.0f, partner_y), IM_COL32(230, 210, 140, 230), mission_line);
+    partner_y += 20.0f;
+
+    // A divergence is not something to hide: the two copies of the world
+    // have to agree, and when they do not, the player has to know.
+    const uint32_t unpaired = world.UnpairedCount() + mission.Unpaired();
+    const uint32_t divergent = world.DivergentCount() + mission.Divergent() + session.GetDivergenceCount();
+    if (unpaired || divergent) {
+        char warn[128];
+        std::snprintf(warn, sizeof(warn), "CO-OP  UNPAIRED %u   DIVERGENT %u", unpaired, divergent);
+        draw->AddText(ImVec2(20.0f, partner_y), IM_COL32(255, 120, 120, 240), warn);
+    }
 }
 
 void MultiplayerManager::DrawImGuiMenu() {

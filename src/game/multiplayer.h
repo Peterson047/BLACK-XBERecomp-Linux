@@ -70,6 +70,9 @@ public:
     void DrawOverlay();
     void DrawImGuiMenu();
     void DrawImGuiHUD();
+    // The co-op panel: the partner, the mission and the state of the two
+    // copies of the world.
+    void DrawCoopHUD(void* draw_list);
     void DrawAdminDebug();
     void NotifyLocalShot(const Vec3& origin, const Vec3& direction, uint32_t weapon);
 
