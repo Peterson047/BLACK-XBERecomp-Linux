@@ -3,12 +3,16 @@
 #include <chrono>
 #include <csignal>
 #include <cstring>
+#include <cstdint>
 #include <filesystem>
 #include <limits.h>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <dlfcn.h>
+#include <signal.h>
+#include <ucontext.h>
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -115,10 +119,23 @@ void Pace() {
 
 }  // namespace app
 
-static void CrashHandler(int sig) {
-    LOGE("Caught signal %d", sig);
+static void CrashHandler(int sig, siginfo_t* info, void* context) {
+    LOGE("Caught signal %d at host address %p", sig, info ? info->si_addr : nullptr);
+#if defined(__x86_64__) && defined(REG_RIP)
+    const auto* uc = static_cast<const ucontext_t*>(context);
+    const uintptr_t pc = static_cast<uintptr_t>(uc->uc_mcontext.gregs[REG_RIP]);
+    Dl_info image{};
+    if (dladdr(reinterpret_cast<const void*>(pc), &image) && image.dli_fbase) {
+        const uintptr_t image_base = reinterpret_cast<uintptr_t>(image.dli_fbase);
+        LOGE("Native RIP %p (image + 0x%lx, %s)", reinterpret_cast<const void*>(pc),
+             static_cast<unsigned long>(pc - image_base), image.dli_fname ? image.dli_fname : "unknown image");
+    } else {
+        LOGE("Native RIP %p", reinterpret_cast<const void*>(pc));
+    }
+#endif
     if (kernel::Thread* t = kernel::Current(); t && t->ctx) {
         LOGE("Guest thread %X crashed", t->id);
+        LOGE("Guest last indirect call %08X", t->ctx->last_icall);
         kernel::LogGuestStack(*t->ctx, 256);
     }
     logx::Flush();
@@ -126,9 +143,13 @@ static void CrashHandler(int sig) {
 }
 
 int main(int argc, char** argv) {
-    std::signal(SIGSEGV, CrashHandler);
-    std::signal(SIGABRT, CrashHandler);
-    std::signal(SIGFPE, CrashHandler);
+    struct sigaction crash_action{};
+    crash_action.sa_sigaction = CrashHandler;
+    sigemptyset(&crash_action.sa_mask);
+    crash_action.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &crash_action, nullptr);
+    sigaction(SIGABRT, &crash_action, nullptr);
+    sigaction(SIGFPE, &crash_action, nullptr);
 
     bool relaunched = false;
     bool is_host = false;

@@ -3,6 +3,8 @@
 
 #include <cstring>
 #include <cstdio>
+#include <cmath>
+#include <algorithm>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -57,6 +59,25 @@ bool SockAddrEqual(const sockaddr* a, const sockaddr* b) {
         return sa1->sin_addr.s_addr == sa2->sin_addr.s_addr && sa1->sin_port == sa2->sin_port;
     }
     return false;
+}
+
+bool IsFiniteState(const PlayerStateData& state) {
+    for (float value : state.pos) if (!std::isfinite(value)) return false;
+    for (float value : state.forward) if (!std::isfinite(value)) return false;
+    return std::isfinite(state.yaw) && std::isfinite(state.pitch) && std::isfinite(state.health);
+}
+
+// Start the next interpolation interval from the current displayed position.
+// On the first packet, snap to spawn instead of interpolating from world zero.
+void ReceivePosition(RemotePlayer& player, const float* position) {
+    for (int axis = 0; axis < 3; ++axis) {
+        player.prev_pos[axis] = player.has_state
+            ? player.prev_pos[axis] + (player.current_pos[axis] - player.prev_pos[axis]) * player.interp_alpha
+            : position[axis];
+        player.current_pos[axis] = position[axis];
+    }
+    player.interp_alpha = player.has_state ? 0.0f : 1.0f;
+    player.has_state = true;
 }
 
 } // namespace
@@ -131,6 +152,7 @@ bool NetworkManager::StartHost(uint16_t port) {
     players_[0].endpoint_str = "127.0.0.1 (Local)";
     players_[0].ping_ms = 0.0f;
     players_[0].last_seen = std::chrono::steady_clock::now();
+    players_[0].state.health = 100.0f;
 
     LogEvent("Server started on port " + std::to_string(port));
     LOGI("NetworkManager: Server started on port %u", port);
@@ -241,6 +263,8 @@ void NetworkManager::Update(float dt) {
         for (auto& p : players_) {
             if (p.active) {
                 p.interp_alpha = std::min(1.0f, p.interp_alpha + dt * 30.0f);
+                p.shot_flash_left = std::max(0.0f, p.shot_flash_left - dt);
+                p.just_fired = p.shot_flash_left > 0.0f;
             }
         }
     }
@@ -323,11 +347,16 @@ void NetworkManager::HandlePacket(const uint8_t* data, size_t size, void* sender
                 client.last_seen = std::chrono::steady_clock::now();
 
                 auto& player = players_[assigned_slot];
+                const bool new_player = !player.active;
                 player.active = true;
                 player.id = client.id;
                 player.name = client.name;
                 player.endpoint_str = SockAddrToString(sa);
                 player.last_seen = client.last_seen;
+                if (new_player) {
+                    player.state = PlayerStateData{};
+                    player.state.health = 100.0f;
+                }
 
                 // Send Join Ack
                 PacketJoinAck ack{};
@@ -351,6 +380,8 @@ void NetworkManager::HandlePacket(const uint8_t* data, size_t size, void* sender
         // Validate client
         uint8_t sender_id = hdr->player_id;
         if (sender_id >= kMaxPlayers || !host_clients_[sender_id].active) return;
+        if (addr_len != host_clients_[sender_id].addr_len ||
+            !SockAddrEqual(sa, reinterpret_cast<const sockaddr*>(host_clients_[sender_id].raw_addr))) return;
         host_clients_[sender_id].last_seen = std::chrono::steady_clock::now();
         players_[sender_id].last_seen = host_clients_[sender_id].last_seen;
 
@@ -368,18 +399,28 @@ void NetworkManager::HandlePacket(const uint8_t* data, size_t size, void* sender
         if (type == MsgType::StateUpdate) {
             if (size < sizeof(PacketState)) return;
             const auto* st = reinterpret_cast<const PacketState*>(data);
+            if (!IsFiniteState(st->state)) return;
 
             // Interpolation buffer update
-            std::memcpy(players_[sender_id].prev_pos, players_[sender_id].current_pos, sizeof(float) * 3);
-            std::memcpy(players_[sender_id].current_pos, st->state.pos, sizeof(float) * 3);
-            players_[sender_id].interp_alpha = 0.0f;
+            ReceivePosition(players_[sender_id], st->state.pos);
 
+            const float authoritative_health = players_[sender_id].state.health;
+            const uint16_t authoritative_frags = players_[sender_id].state.frags;
+            const uint16_t authoritative_deaths = players_[sender_id].state.deaths;
             players_[sender_id].state = st->state;
+            players_[sender_id].state.health = authoritative_health;
+            players_[sender_id].state.frags = authoritative_frags;
+            players_[sender_id].state.deaths = authoritative_deaths;
 
-            // Forward state to other clients
+            // Replicate authoritative combat values to every client, including
+            // the sender. Clients may still provide their own movement state.
+            PacketState authoritative = *st;
+            authoritative.state.health = players_[sender_id].state.health;
+            authoritative.state.frags = players_[sender_id].state.frags;
+            authoritative.state.deaths = players_[sender_id].state.deaths;
             for (size_t i = 1; i < kMaxPlayers; ++i) {
-                if (i != sender_id && host_clients_[i].active) {
-                    SendPacket(data, size, host_clients_[i].raw_addr, host_clients_[i].addr_len);
+                if (host_clients_[i].active) {
+                    SendPacket(&authoritative, sizeof(authoritative), host_clients_[i].raw_addr, host_clients_[i].addr_len);
                 }
             }
             return;
@@ -388,6 +429,7 @@ void NetworkManager::HandlePacket(const uint8_t* data, size_t size, void* sender
         if (type == MsgType::Shoot) {
             if (size < sizeof(PacketShoot)) return;
             players_[sender_id].just_fired = true;
+            players_[sender_id].shot_flash_left = 0.12f;
             // Broadcast shoot to all other clients
             for (size_t i = 1; i < kMaxPlayers; ++i) {
                 if (i != sender_id && host_clients_[i].active) {
@@ -400,21 +442,32 @@ void NetworkManager::HandlePacket(const uint8_t* data, size_t size, void* sender
         if (type == MsgType::Hit) {
             if (size < sizeof(PacketHit)) return;
             const auto* hit = reinterpret_cast<const PacketHit*>(data);
-            if (hit->victim_id < kMaxPlayers && players_[hit->victim_id].active) {
-                players_[hit->victim_id].state.health -= hit->damage;
-                if (players_[hit->victim_id].state.health <= 0.0f) {
-                    players_[hit->victim_id].state.health = 100.0f; // Respawn
-                    players_[sender_id].state.frags++;
-                    players_[hit->victim_id].state.deaths++;
-                    LogEvent(players_[sender_id].name + " fragged " + players_[hit->victim_id].name);
-                }
+            if (!std::isfinite(hit->damage) || hit->damage <= 0.0f || hit->damage > 100.0f ||
+                !std::isfinite(hit->hit_pos[0]) || !std::isfinite(hit->hit_pos[1]) || !std::isfinite(hit->hit_pos[2]) ||
+                hit->victim_id >= kMaxPlayers || hit->victim_id == sender_id ||
+                !players_[hit->victim_id].active || !damage_enabled_) return;
+
+            const float applied_damage = std::clamp(hit->damage * damage_scale_, 0.0f, 1000.0f);
+            if (applied_damage <= 0.0f) return;
+            players_[hit->victim_id].state.health = std::clamp(
+                players_[hit->victim_id].state.health - applied_damage, 0.0f, 100.0f);
+            if (players_[hit->victim_id].state.health <= 0.0f) {
+                players_[hit->victim_id].state.health = 100.0f; // Respawn
+                players_[sender_id].state.frags++;
+                players_[hit->victim_id].state.deaths++;
+                LogEvent(players_[sender_id].name + " fragged " + players_[hit->victim_id].name);
             }
-            // Broadcast hit
+
+            PacketHit authoritative_hit = *hit;
+            authoritative_hit.damage = applied_damage;
+            // Hit notifications remain compatible with the current wire format.
             for (size_t i = 1; i < kMaxPlayers; ++i) {
                 if (host_clients_[i].active) {
-                    SendPacket(data, size, host_clients_[i].raw_addr, host_clients_[i].addr_len);
+                    SendPacket(&authoritative_hit, sizeof(authoritative_hit), host_clients_[i].raw_addr, host_clients_[i].addr_len);
                 }
             }
+            SendAuthoritativeState(hit->victim_id);
+            if (sender_id != hit->victim_id) SendAuthoritativeState(sender_id);
             return;
         }
 
@@ -440,10 +493,19 @@ void NetworkManager::HandlePacket(const uint8_t* data, size_t size, void* sender
 
     } else if (mode_ == NetMode::Client) {
         // CLIENT PACKET HANDLING
+        if (!server_sockaddr_ || !SockAddrEqual(sa, reinterpret_cast<const sockaddr*>(server_sockaddr_))) return;
         if (type == MsgType::JoinAck) {
             if (size < sizeof(PacketJoinAck)) return;
             const auto* ack = reinterpret_cast<const PacketJoinAck*>(data);
+            if (ack->assigned_id == 0 || ack->assigned_id >= kMaxPlayers) return;
             local_player_id_ = ack->assigned_id;
+            auto& local_player = players_[local_player_id_];
+            local_player.active = true;
+            local_player.id = local_player_id_;
+            local_player.name = local_player_name_;
+            local_player.endpoint_str = host_ip_ + ":" + std::to_string(port_);
+            local_player.last_seen = std::chrono::steady_clock::now();
+            if (local_player.state.health <= 0.0f) local_player.state.health = 100.0f;
             LogEvent("Connected! Assigned Player ID: " + std::to_string(local_player_id_));
             LOGI("NetworkManager: Joined as player ID %u", local_player_id_);
             return;
@@ -461,7 +523,14 @@ void NetworkManager::HandlePacket(const uint8_t* data, size_t size, void* sender
             if (size < sizeof(PacketState)) return;
             const auto* st = reinterpret_cast<const PacketState*>(data);
             uint8_t pid = st->header.player_id;
-            if (pid < kMaxPlayers && pid != local_player_id_) {
+            if (!IsFiniteState(st->state)) return;
+            if (pid < kMaxPlayers && pid == local_player_id_) {
+                // Server echo: accept only authoritative health and score fields;
+                // retain local movement and combat animation state.
+                players_[pid].state.health = st->state.health;
+                players_[pid].state.frags = st->state.frags;
+                players_[pid].state.deaths = st->state.deaths;
+            } else if (pid < kMaxPlayers) {
                 players_[pid].active = true;
                 players_[pid].id = pid;
                 if (players_[pid].name.empty()) {
@@ -469,9 +538,7 @@ void NetworkManager::HandlePacket(const uint8_t* data, size_t size, void* sender
                 }
 
                 // Interpolation buffer update
-                std::memcpy(players_[pid].prev_pos, players_[pid].current_pos, sizeof(float) * 3);
-                std::memcpy(players_[pid].current_pos, st->state.pos, sizeof(float) * 3);
-                players_[pid].interp_alpha = 0.0f;
+                ReceivePosition(players_[pid], st->state.pos);
 
                 players_[pid].state = st->state;
                 players_[pid].last_seen = std::chrono::steady_clock::now();
@@ -484,6 +551,7 @@ void NetworkManager::HandlePacket(const uint8_t* data, size_t size, void* sender
             uint8_t pid = hdr->player_id;
             if (pid < kMaxPlayers && pid != local_player_id_) {
                 players_[pid].just_fired = true;
+                players_[pid].shot_flash_left = 0.12f;
             }
             return;
         }
@@ -533,7 +601,7 @@ void NetworkManager::CheckTimeouts() {
 }
 
 void NetworkManager::SendLocalState(const PlayerStateData& state) {
-    if (!IsConnected()) return;
+    if (!IsConnected() || !IsFiniteState(state)) return;
 
     PacketState pkt{};
     pkt.header.magic = kProtocolMagic;
@@ -545,7 +613,17 @@ void NetworkManager::SendLocalState(const PlayerStateData& state) {
 
     if (mode_ == NetMode::Host) {
         // Update local state in host's array
+        const float authoritative_health = players_[0].state.health;
+        const uint16_t authoritative_frags = players_[0].state.frags;
+        const uint16_t authoritative_deaths = players_[0].state.deaths;
+        players_[0].has_state = true;
         players_[0].state = state;
+        players_[0].state.health = authoritative_health;
+        players_[0].state.frags = authoritative_frags;
+        players_[0].state.deaths = authoritative_deaths;
+        pkt.state.health = authoritative_health;
+        pkt.state.frags = authoritative_frags;
+        pkt.state.deaths = authoritative_deaths;
         // Broadcast to all active clients
         for (size_t i = 1; i < kMaxPlayers; ++i) {
             if (host_clients_[i].active) {
@@ -553,6 +631,15 @@ void NetworkManager::SendLocalState(const PlayerStateData& state) {
             }
         }
     } else if (mode_ == NetMode::Client) {
+        auto& local_player = players_[local_player_id_];
+        const float authoritative_health = local_player.state.health;
+        const uint16_t authoritative_frags = local_player.state.frags;
+        const uint16_t authoritative_deaths = local_player.state.deaths;
+        local_player.has_state = true;
+        local_player.state = state;
+        local_player.state.health = authoritative_health;
+        local_player.state.frags = authoritative_frags;
+        local_player.state.deaths = authoritative_deaths;
         SendPacket(&pkt, sizeof(pkt), server_sockaddr_, server_socklen_);
     }
 }
@@ -582,7 +669,7 @@ void NetworkManager::BroadcastShoot(const float origin[3], const float dir[3], u
 }
 
 void NetworkManager::SendHit(uint8_t victim_id, float damage, const float hit_pos[3]) {
-    if (!IsConnected()) return;
+    if (!IsConnected() || !hit_pos) return;
 
     PacketHit pkt{};
     pkt.header.magic = kProtocolMagic;
@@ -595,8 +682,13 @@ void NetworkManager::SendHit(uint8_t victim_id, float damage, const float hit_po
     std::memcpy(pkt.hit_pos, hit_pos, sizeof(pkt.hit_pos));
 
     if (mode_ == NetMode::Host) {
-        if (victim_id < kMaxPlayers && players_[victim_id].active) {
-            players_[victim_id].state.health -= damage;
+        if (!damage_enabled_ || !std::isfinite(damage) || damage <= 0.0f || damage > 100.0f ||
+            victim_id >= kMaxPlayers || victim_id == 0 || !players_[victim_id].active ||
+            !std::isfinite(hit_pos[0]) || !std::isfinite(hit_pos[1]) || !std::isfinite(hit_pos[2])) return;
+        pkt.damage = std::clamp(damage * damage_scale_, 0.0f, 1000.0f);
+        if (pkt.damage <= 0.0f) return;
+        {
+            players_[victim_id].state.health = std::clamp(players_[victim_id].state.health - pkt.damage, 0.0f, 100.0f);
             if (players_[victim_id].state.health <= 0.0f) {
                 players_[victim_id].state.health = 100.0f;
                 players_[0].state.frags++;
@@ -609,9 +701,79 @@ void NetworkManager::SendHit(uint8_t victim_id, float damage, const float hit_po
                 SendPacket(&pkt, sizeof(pkt), host_clients_[i].raw_addr, host_clients_[i].addr_len);
             }
         }
+        SendAuthoritativeState(victim_id);
+        SendAuthoritativeState(0);
     } else if (mode_ == NetMode::Client) {
+        if (!std::isfinite(damage) || damage <= 0.0f || damage > 100.0f ||
+            !std::isfinite(hit_pos[0]) || !std::isfinite(hit_pos[1]) || !std::isfinite(hit_pos[2])) return;
         SendPacket(&pkt, sizeof(pkt), server_sockaddr_, server_socklen_);
     }
+}
+
+void NetworkManager::SendAuthoritativeState(uint8_t player_id) {
+    if (mode_ != NetMode::Host || player_id >= kMaxPlayers || !players_[player_id].active) return;
+    PacketState pkt{};
+    pkt.header.magic = kProtocolMagic;
+    pkt.header.type = static_cast<uint8_t>(MsgType::StateUpdate);
+    pkt.header.player_id = player_id;
+    pkt.header.sequence = ++sequence_counter_;
+    pkt.header.timestamp_ms = GetTimeMs();
+    pkt.state = players_[player_id].state;
+    for (size_t i = 1; i < kMaxPlayers; ++i) {
+        if (host_clients_[i].active) {
+            SendPacket(&pkt, sizeof(pkt), host_clients_[i].raw_addr, host_clients_[i].addr_len);
+        }
+    }
+}
+
+bool NetworkManager::SetDamageEnabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (mode_ != NetMode::Host) return false;
+    damage_enabled_ = enabled;
+    LogEvent(std::string("Host ") + (enabled ? "enabled" : "disabled") + " damage");
+    return true;
+}
+
+bool NetworkManager::SetDamageScale(float scale) {
+    if (!std::isfinite(scale)) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (mode_ != NetMode::Host) return false;
+    damage_scale_ = std::clamp(scale, 0.0f, 10.0f);
+    LogEvent("Host set damage scale to " + std::to_string(damage_scale_));
+    return true;
+}
+
+bool NetworkManager::IsDamageEnabled() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return damage_enabled_;
+}
+
+float NetworkManager::GetDamageScale() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return damage_scale_;
+}
+
+bool NetworkManager::AdminHealPlayer(uint8_t player_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (mode_ != NetMode::Host || player_id >= kMaxPlayers || !players_[player_id].active) return false;
+    players_[player_id].state.health = 100.0f;
+    LogEvent("Host healed " + players_[player_id].name);
+    SendAuthoritativeState(player_id);
+    return true;
+}
+
+bool NetworkManager::AdminResetStats() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (mode_ != NetMode::Host) return false;
+    for (uint8_t i = 0; i < kMaxPlayers; ++i) {
+        if (!players_[i].active) continue;
+        players_[i].state.health = 100.0f;
+        players_[i].state.frags = 0;
+        players_[i].state.deaths = 0;
+        SendAuthoritativeState(i);
+    }
+    LogEvent("Host reset player stats");
+    return true;
 }
 
 void NetworkManager::SendChatMessage(const std::string& msg) {

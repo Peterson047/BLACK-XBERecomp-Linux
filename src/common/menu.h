@@ -7,6 +7,8 @@
 namespace app {
 
 bool MenuOpen();
+bool AdminDebugOpen();
+void SetAdminDebugOpen(bool open);
 bool Capturing();  // a key binding waits for a key
 void ToggleMenu();
 void DrawUi(double fps);

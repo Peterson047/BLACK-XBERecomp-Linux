@@ -293,6 +293,16 @@ call = "SkipVideo"
 at = 0x124351
 call = "MenuTick"
 
+# Consume multiplayer launch requests on the guest frame thread.
+[[hook]]
+at = 0x20F6A0
+call = "DirectMapLaunchTick"
+
+# Capture the async resource table operands if the loader reaches a null lookup.
+[[hook]]
+at = 0x151408
+call = "TraceNullResourceLookup"
+
 [[hook]]
 at = 0x1BB2BA
 call = "ZoomStep"

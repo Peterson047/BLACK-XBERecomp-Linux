@@ -2,6 +2,7 @@
 #include "game/layout.h"
 #include "common/aspect.h"
 #include "common/options.h"
+#include "common/menu.h"
 #include "core/log.h"
 #include "xdk/d3d8.h"
 
@@ -75,7 +76,24 @@ MultiplayerManager::MultiplayerManager() {
 MultiplayerManager::~MultiplayerManager() = default;
 
 void MultiplayerManager::Init() {
+    direct_map_launch_requested_.store(false, std::memory_order_release);
+    was_network_connected_ = false;
     LOGI("MultiplayerManager: Initialized CS 1.6 Deathmatch System for Veblensk");
+}
+
+void MultiplayerManager::RequestDirectMapLaunch() {
+    bool already_requested = direct_map_launch_requested_.exchange(true, std::memory_order_acq_rel);
+    if (!already_requested) {
+        LOGI("MultiplayerManager: Queued direct launch to Veblensk");
+    }
+}
+
+bool MultiplayerManager::ConsumeDirectMapLaunchRequest() {
+    return direct_map_launch_requested_.exchange(false, std::memory_order_acq_rel);
+}
+
+bool MultiplayerManager::HasDirectMapLaunchRequest() const {
+    return direct_map_launch_requested_.load(std::memory_order_acquire);
 }
 
 bool MultiplayerManager::IsInGame() const {
@@ -103,28 +121,29 @@ void MultiplayerManager::ClearCampaignEnemies() {
     uint32_t list = R32(mgr + 0x79BC);
     if (!list) return;
 
-    auto remote_players = net::NetworkManager::Get().GetPlayers();
-    uint8_t local_id = net::NetworkManager::Get().GetLocalPlayerId();
-    uint32_t active_puppets = 0;
-    for (const auto& rpl : remote_players) {
-        if (rpl.id != local_id && rpl.active) {
-            active_puppets++;
+    if (actor_manager_ != mgr) {
+        native_actor_types_.clear();
+        actor_manager_ = mgr;
+    }
+    // Record initialized actor categories without disabling native components.
+    for (uint32_t i = 0; i < count && i < 64; ++i) {
+        const uint32_t actor = R32(list + i * 4);
+        static uint32_t logged[8]{};
+        if (actor && i < 8 && logged[i] != actor) {
+            LOGI("MP actor slot %u: object=%08X vtable=%08X type=%u used=%u capacity=%u", i,
+                 actor, R32(actor), R32(actor + 0xC4), R32(mgr + 0x79B8), count);
+            logged[i] = actor;
         }
+        if (!actor || R32(actor) != 0x28C1E8) continue;
+        const uint32_t type = R32(actor + 0xC4);
+        if (type) native_actor_types_.emplace(actor, type);
+        // Native type is a component-dispatch discriminator, not an enable bit.
+        // Keep it intact; zeroing it routes actors through incompatible handlers.
+
     }
 
-    // Deactivate and hide all campaign enemies past the active puppets
-    for (uint32_t i = active_puppets; i < count && i < 64; ++i) {
-        uint32_t enemy = R32(list + i * 4);
-        if (enemy) {
-            W32(enemy + 0xC4, 0); // Inactive
-            G<float>(enemy + 0xA0) = 9999.0f;
-            G<float>(enemy + 0xA4) = 9999.0f;
-            G<float>(enemy + 0xA8) = 9999.0f;
-        }
-    }
-
-    // Ensure the AI list only processes the active puppets
-    W32(mgr + 0x79B4, active_puppets);
+    // +79B4 is capacity and +79B8 is the used size of the native container.
+    // Preserve both: changing capacity here corrupts later actor registration.
 }
 
 // Pick optimal random spawn point away from active enemies (CS DM style)
@@ -204,71 +223,28 @@ void MultiplayerManager::TriggerHitmarker() {
     hitmarker_timer_ = 0.20f;
 }
 
-bool MultiplayerManager::WorldToScreen(const Vec3& world_pos, float& screen_x, float& screen_y, float& dist) const {
-    uint32_t p = Player();
-    if (!p) return false;
-
-    Vec3 cam_pos(
-        G<float>(p + kPlayerEye),
-        G<float>(p + kPlayerEye + 4),
-        G<float>(p + kPlayerEye + 8)
-    );
-
-    Vec3 cam_fwd = Normalize(Vec3(
-        G<float>(p + kPlayerForward),
-        G<float>(p + kPlayerForward + 4),
-        G<float>(p + kPlayerForward + 8)
-    ));
-
-    Vec3 up(0.0f, 1.0f, 0.0f);
-    if (std::abs(cam_fwd.y) > 0.99f) {
-        up = Vec3(0.0f, 0.0f, 1.0f);
-    }
-    Vec3 right = Normalize(Cross(cam_fwd, up));
-    Vec3 real_up = Normalize(Cross(right, cam_fwd));
-
-    Vec3 rel = world_pos - cam_pos;
-    dist = std::sqrt(Dot(rel, rel));
-
-    float z = Dot(rel, cam_fwd);
-    if (z <= 0.15f) return false;
-
-    float x = Dot(rel, right);
-    float y = Dot(rel, real_up);
-
-    ImGuiIO& io = ImGui::GetIO();
-    float screen_w = io.DisplaySize.x;
-    float screen_h = io.DisplaySize.y;
-    if (screen_w <= 0 || screen_h <= 0) return false;
-
-    float fov_deg = float(std::clamp(game::Opt().fov, 45u, 140u));
-    float aspect = screen_w / screen_h;
-    float half_fov_rad = (fov_deg * 0.5f) * (3.14159265f / 180.0f);
-    float tan_half = std::tan(half_fov_rad);
-
-    screen_x = (screen_w * 0.5f) + (x / (z * tan_half)) * (screen_w * 0.5f);
-    screen_y = (screen_h * 0.5f) - (y / (z * tan_half / aspect)) * (screen_h * 0.5f);
-
-    return (screen_x >= -300 && screen_x <= screen_w + 300 && screen_y >= -300 && screen_y <= screen_h + 300);
-}
 
 void MultiplayerManager::UpdateEnemyPuppet(uint8_t slot_idx, const Vec3& pos, const Vec3& forward, float yaw, float pitch, float move_rate, bool is_crouching) {
     uint32_t mgr = R32(0x002D1980);
     if (!mgr) return;
 
-    uint32_t list = R32(mgr + 0x79BC);
+    // Only use an actor already registered and initialized by the engine.
+    // The old fallback fabricated an actor inside the manager and overwrote its
+    // vtable, risking guest-state corruption when a remote client joined.
+    const uint32_t count = R32(mgr + 0x79B4);
+    const uint32_t list = R32(mgr + 0x79BC);
+    if (!list || slot_idx >= 32) return;
     uint32_t actor = 0;
-    if (list && slot_idx < 32) {
-        actor = R32(list + slot_idx * 4);
-    }
-    if (!actor) {
-        actor = mgr + 0xA0 + (slot_idx % 32) * 0x3C0;
+    uint32_t ordinal = 0;
+    for (uint32_t i = 0; i < count && i < 64; ++i) {
+        const uint32_t candidate = R32(list + i * 4);
+        if (!candidate || R32(candidate) != 0x28C1E8) continue;
+        if (ordinal++ == slot_idx) { actor = candidate; break; }
     }
     if (!actor) return;
-
-    if (R32(actor) != 0x28C1E8) {
-        W32(actor, 0x28C1E8);
-    }
+    const auto native_type = native_actor_types_.find(actor);
+    if (native_type == native_actor_types_.end()) return;
+    W32(actor + 0xC4, native_type->second);
 
     // Orient character's 3D affine matrix to face look direction
     Vec3 fwd = Normalize(Vec3(forward.x, 0.0f, forward.z));
@@ -300,32 +276,11 @@ void MultiplayerManager::UpdateEnemyPuppet(uint8_t slot_idx, const Vec3& pos, co
     G<float>(actor + 0xA8) = pos.z;
     G<float>(actor + 0xAC) = 1.0f;
 
-    // Stance & Crouch state
-    G<uint8_t>(actor + 0x3A1) = is_crouching ? 1 : 0;
-    G<uint8_t>(actor + 0x3A2) = 0;
-    G<uint8_t>(actor + 0x3A4) = 0;
+    // Keep native type, AI/action state and animation controllers intact. The
+    // previous writes treated unverified controller offsets as speed and stance
+    // controls, continually forcing action state while moving the model.
+    G<uint8_t>(actor + 0xC8) = 0; // Render at full detail.
 
-    // Locomotion and animation controller
-    uint32_t loc = R32(actor + 0x324);
-    if (loc) {
-        W32(loc + 0x90, 1); // Normal character locomotion
-        G<uint8_t>(loc + 0x40) = is_crouching ? 1 : 0;
-        G<float>(loc + 0x84) = move_rate; // 0.0f for idle, 4.5f for walking/running
-        G<float>(loc + 0x2D8) = 4.0f;     // Base run rate reference (prevents negative multiplier)
-
-        // Angles converted to DEGREES for the Black engine
-        float yaw_deg = yaw * (180.0f / 3.14159265f);
-        float pitch_deg = pitch * (180.0f / 3.14159265f);
-
-        G<float>(loc + 0x80) = 0.0f;      // Movement relative to facing (0 deg = straight ahead)
-        G<float>(loc + 0x14) = yaw_deg;   // Body yaw (degrees)
-        G<float>(loc + 0x10) = yaw_deg;   // Aim yaw (degrees)
-        G<float>(loc + 0x1C) = pitch_deg; // Aim pitch (degrees: -90 to +90)
-    }
-
-    // Mark active and highest detail level
-    G<uint8_t>(actor + 0xC8) = 0; // Force LOD 0
-    W32(actor + 0xC4, 1);        // Marked active
 }
 
 // Check Hit Detection with CS 1.6 Hitbox Zones (Head, Chest, Stomach, Legs)
@@ -334,7 +289,7 @@ void MultiplayerManager::CheckHitDetection(const Vec3& origin, const Vec3& dir, 
     uint8_t my_id = net::NetworkManager::Get().GetLocalPlayerId();
 
     for (const auto& other : players) {
-        if (other.id == my_id || !other.active) continue;
+        if (other.id == my_id || !other.active || !other.has_state) continue;
 
         Vec3 target(other.state.pos[0], other.state.pos[1], other.state.pos[2]);
         Vec3 to_target = target - origin;
@@ -344,7 +299,7 @@ void MultiplayerManager::CheckHitDetection(const Vec3& origin, const Vec3& dir, 
 
         Vec3 closest_point = origin + (dir * proj);
         Vec3 diff = target - closest_point;
-        float dist_sq = Dot(diff, diff);
+        float dist_sq = diff.x * diff.x + diff.z * diff.z;
 
         // Cylindrical body hitbox: 0.85m radius
         if (dist_sq < (0.85f * 0.85f)) {
@@ -413,29 +368,52 @@ void MultiplayerManager::CheckHitDetection(const Vec3& origin, const Vec3& dir, 
     }
 }
 
-void MultiplayerManager::CheckLocalPlayerShooting(const Vec3& eye, const Vec3& forward, uint32_t weapon) {
-    uint32_t p = Player();
-    if (!p) return;
+void MultiplayerManager::NotifyLocalShot(const Vec3& origin, const Vec3& direction, uint32_t weapon) {
+    if (!net::NetworkManager::Get().IsConnected()) return;
+    std::lock_guard<std::mutex> lock(shots_mutex_);
+    // Preserve the aim at the native shot, before the next mouse/recoil update.
+    if (local_shots_.size() >= 64) return;
+    local_shots_.push_back({origin, Normalize(direction), weapon});
+    pending_shots_.store(static_cast<uint32_t>(local_shots_.size()), std::memory_order_relaxed);
+    confirmed_shots_.fetch_add(1, std::memory_order_relaxed);
+}
 
-    bool is_firing = (R32(p + kPlayerFireRequest) != 0);
-
-    if (is_firing && !was_firing_) {
-        // Cancel spawn protection on shooting
-        spawn_protection_timer_ = 0.0f;
-
-        float origin[3] = {eye.x, eye.y, eye.z};
-        float dir[3] = {forward.x, forward.y, forward.z};
-        net::NetworkManager::Get().BroadcastShoot(origin, dir, weapon);
-        CheckHitDetection(eye, forward, weapon);
-
-        Vec3 end_pos = eye + (forward * 90.0f);
-        AddTracer(eye, end_pos);
+void MultiplayerManager::CheckLocalPlayerShooting(const Vec3&, const Vec3&, uint32_t) {
+    std::vector<LocalShot> shots;
+    {
+        std::lock_guard<std::mutex> lock(shots_mutex_);
+        shots.swap(local_shots_);
+        pending_shots_.store(0, std::memory_order_relaxed);
     }
-    was_firing_ = is_firing;
+    if (app::MenuOpen()) return;
+    for (const auto& shot : shots) {
+        spawn_protection_timer_ = 0.0f;
+        shot_flash_timer_ = 0.12f;
+        const float origin[3] = {shot.origin.x, shot.origin.y, shot.origin.z};
+        const float dir[3] = {shot.direction.x, shot.direction.y, shot.direction.z};
+        net::NetworkManager::Get().BroadcastShoot(origin, dir, shot.weapon);
+        CheckHitDetection(shot.origin, shot.direction, shot.weapon);
+        AddTracer(shot.origin, shot.origin + shot.direction * 90.0f);
+    }
 }
 
 void MultiplayerManager::Update(float dt) {
-    net::NetworkManager::Get().Update(dt);
+    auto& network = net::NetworkManager::Get();
+    network.Update(dt);
+    shot_flash_timer_ = std::max(0.0f, shot_flash_timer_ - dt);
+    for (const auto& player : network.GetPlayers()) {
+        if (player.id == network.GetLocalPlayerId()) {
+            local_health_ = player.state.health;
+            local_frags_ = player.state.frags;
+            local_deaths_ = player.state.deaths;
+        }
+    }
+
+    const bool network_connected = network.IsConnected();
+    if (network_connected && !was_network_connected_) {
+        RequestDirectMapLaunch();
+    }
+    was_network_connected_ = network_connected;
 
     if (spawn_protection_timer_ > 0.0f) {
         spawn_protection_timer_ -= dt;
@@ -479,7 +457,7 @@ void MultiplayerManager::Update(float dt) {
     if (!IsInGame()) return;
     if (!net::NetworkManager::Get().IsConnected()) return;
 
-    // Remove singleplayer AI wave enemies from Mission 1
+    // Collect initialized native actors for remote proxies.
     ClearCampaignEnemies();
 
     uint32_t p = Player();
@@ -498,17 +476,18 @@ void MultiplayerManager::Update(float dt) {
     );
 
     uint32_t weapon = R32(p + kPlayerWeapon);
-    bool firing = (R32(p + kPlayerFireRequest) != 0);
+    bool firing = shot_flash_timer_ > 0.0f && !app::MenuOpen();
     bool aiming = (G<float>(p + kPlayerZoom) > 1.05f);
 
     CheckLocalPlayerShooting(eye, forward, weapon);
+    firing = shot_flash_timer_ > 0.0f && !app::MenuOpen();
 
     // Update puppets for active remote players with GoldSrc entity interpolation
     auto remote_players = net::NetworkManager::Get().GetPlayers();
     uint8_t local_id = net::NetworkManager::Get().GetLocalPlayerId();
     uint8_t puppet_slot = 0;
     for (const auto& rpl : remote_players) {
-        if (rpl.id != local_id && rpl.active) {
+        if (rpl.id != local_id && rpl.active && rpl.has_state) {
             Vec3 rpos(rpl.state.pos[0], rpl.state.pos[1], rpl.state.pos[2]);
             if (rpl.interp_alpha < 1.0f) {
                 float a = rpl.interp_alpha;
@@ -540,10 +519,11 @@ void MultiplayerManager::Update(float dt) {
     float eye_height = (base_feet_y > -100.0f && base_feet_y < 100.0f) ? (eye.y - base_feet_y) : 1.70f;
     bool is_crouching = (eye_height < 1.35f);
 
-    // Local movement speed detection
-    static Vec3 s_last_local_eye = eye;
-    Vec3 move_delta = eye - s_last_local_eye;
-    s_last_local_eye = eye;
+    // Body translation avoids treating camera sway/recoil as walking.
+    const Vec3 body(G<float>(p + 0xA0), G<float>(p + 0xA4), G<float>(p + 0xA8));
+    static Vec3 s_last_local_body = body;
+    Vec3 move_delta = body - s_last_local_body;
+    s_last_local_body = body;
     float horizontal_move = std::sqrt(move_delta.x * move_delta.x + move_delta.z * move_delta.z);
     float local_speed = (dt > 0.0001f) ? (horizontal_move / dt) : 0.0f;
     bool is_moving = (local_speed > 0.35f);
@@ -620,7 +600,7 @@ void MultiplayerManager::DrawImGuiHUD() {
 
     // 2. Draw 3D Player Models & Tags
     for (const auto& pl : players) {
-        if (pl.id == my_id || !pl.active) continue;
+        if (pl.id == my_id || !pl.active || !pl.has_state) continue;
 
         Vec3 pos(pl.state.pos[0], pl.state.pos[1], pl.state.pos[2]);
         if (pl.interp_alpha < 1.0f) {
@@ -895,3 +875,71 @@ void MultiplayerManager::DrawImGuiMenu() {
 }
 
 } // namespace game
+
+// Runs on the guest thread at the start of the game's frame tick. UI and network
+// code only queue a request; all guest memory writes and the transition call stay
+// on this thread.
+void DirectMapLaunchTick(X86Context& ctx, uint8_t*) {
+    auto& multiplayer = game::MultiplayerManager::Get();
+    if (!multiplayer.HasDirectMapLaunchRequest()) return;
+
+    uint32_t game_obj = kernel::R32(layout::kGame);
+    if (!game_obj) return;
+
+    // This entry point is intended for the front-end. Do not interrupt a level
+    // that is already loading or active.
+    const uint32_t game_state = kernel::R32(game_obj + layout::kGameState);
+    if (!game_state) return;
+    if (game_state != game_obj + layout::kFrontEnd) {
+        // Keep the connection request through boot, logos and intro films. The
+        // world pointer is initialized before the front-end and cannot identify
+        // whether a playable level is active.
+        return;
+    }
+    // PressStart normally selects a controller and binds the game's action map.
+    // Direct launch bypasses that screen. Port 0 is the keyboard/mouse virtual
+    // controller; use its descriptor only after the engine has initialized it.
+    if (!kernel::R32(game_obj + 0x21060)) {
+        const uint32_t input_manager = kernel::R32(0x002D45E8);
+        if (!input_manager) return;
+        const uint32_t controller = input_manager + 0x518;
+        if (kernel::R32(controller + 0x0C) != input_manager + 0x98) return;
+        kernel::W32(game_obj + 0x21060, controller);
+        kernel::G<uint8_t>(controller + 0x08) = 1;
+        const uint32_t ui = kernel::R32(layout::kUi);
+        if (ui) kernel::W32(ui + layout::kWaitsForStart, 0);
+        LOGI("DirectMapLaunchTick: Selected initialized controller on port 0");
+    }
+    if (!kernel::R32(0x002F3BD4)) {
+        X86Context bind = ctx;
+        bind.eax = game_obj + 0x20174;
+        kernel::CallGuest(bind, 0x001F1550, {});
+    }
+    if (!multiplayer.ConsumeDirectMapLaunchRequest()) return;
+
+    // Match the values written by the game's own Mission 1 launch routine.
+    kernel::G<uint8_t>(game_obj + 0x2020C) = 0; // Level 0: Veblensk
+    kernel::G<uint8_t>(game_obj + 0x2020D) = 1;
+    kernel::G<uint8_t>(game_obj + 0x2020E) = 1;
+    kernel::W32(0x002D0D68, game_obj + 0x20F78);
+
+    LOGI("DirectMapLaunchTick: Starting Veblensk through the engine state transition");
+    kernel::CallGuest(ctx, 0x0020DDD0, {0});
+}
+
+// Runs immediately before sub_001513C0 dereferences its resource table. Keep
+// this diagnostic conditional so normal loader activity does not flood logs.
+// Capture the resource header and the active loader state before the null read.
+void TraceNullResourceLookup(X86Context& ctx, uint8_t*) {
+    if (ctx.edx != 0) return;
+
+    const uint32_t component = ctx.ecx;
+    const uint32_t header = component >= 0x10000 ? kernel::R32(component) : 0;
+    const uint32_t component_count = component >= 0x10000 ? kernel::R32(component + 0x54) : 0;
+    const uint32_t component_table = component >= 0x10000 ? kernel::R32(component + 0x5C) : 0;
+    const uint32_t loader_stage = ctx.ebp >= 0x10000 ? kernel::R32(ctx.ebp + 0x854) : 0;
+    const uint32_t state = ctx.esi >= 0x10000 ? kernel::R32(ctx.esi) : 0;
+
+    LOGE("ResourceLookup: null table at guest 00151408 index=%08X component=%08X header=%08X count=%08X table=%08X loader=%08X stage=%08X state=%08X esp=%08X",
+         ctx.eax, component, header, component_count, component_table, ctx.ebp, loader_stage, state, ctx.esp);
+}

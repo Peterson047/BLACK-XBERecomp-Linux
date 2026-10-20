@@ -477,6 +477,7 @@ void ReleaseCursor() {
 #ifndef _WIN32
 void OnSdlEvent(const void* ev) {
     const SDL_Event& e = *static_cast<const SDL_Event*>(ev);
+    HandleSdlDeviceEvent(ev);
     switch (e.type) {
         case SDL_EVENT_MOUSE_MOTION: {
             if (!Active()) break;

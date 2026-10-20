@@ -9,6 +9,7 @@
 #include "common/options.h"
 #include "core/input.h"
 #include "game/layout.h"
+#include "game/multiplayer.h"
 #include "xdk/d3d8.h"
 #include "xdk/hle.h"
 #include "xdk/layout.h"
@@ -314,7 +315,22 @@ X86_FUNC(sub_001EEFD0) {
     float& wait = G<float>(weapon + kWeaponWait);
     float rest = wait;
     float dt = Dt();
+    const uint32_t inventory = R32(weapon + 0xF4);
+    const uint16_t ammo_before = inventory ? G<uint16_t>(inventory + 0x18) : 0;
+    const uint32_t owner = R32(weapon + kWeaponOwner);
+    const bool local = owner == Player();
+    game::Vec3 shot_origin, shot_direction;
+    if (local) {
+        shot_origin = {G<float>(owner + kPlayerEye), G<float>(owner + kPlayerEye + 4), G<float>(owner + kPlayerEye + 8)};
+        shot_direction = {G<float>(owner + kPlayerForward), G<float>(owner + kPlayerForward + 4), G<float>(owner + kPlayerForward + 8)};
+    }
     __imp__sub_001EEFD0(ctx, base);
+    // Native successful-shot paths decrement the magazine at 0x1EFBBB.
+    if (inventory && R32(weapon + kWeaponOwner) == Player() &&
+        R32(weapon + 0xF4) == inventory &&
+        G<uint16_t>(inventory + 0x18) < ammo_before) {
+        game::MultiplayerManager::Get().NotifyLocalShot(shot_origin, shot_direction, weapon);
+    }
     uint32_t me = R32(weapon + kWeaponOwner);
     if (me == Player()) {
         if (R32(weapon + kWeaponState) != 1 || wait != rest) g_idle_early = false;
@@ -612,4 +628,15 @@ void SkipVideo(X86Context&, uint8_t*) {
     std::string name = ReadCString(player + kFilmName, 8);
     bool intro = name.rfind("LO_", 0) == 0 || name.rfind("02_", 0) == 0;
     if (pressed || (game::Opt().skip_intros && intro)) G<uint8_t>(player + kFilmStop) = 1;
+}
+
+namespace game {
+void CaptureMultiplayerCamera();
+}
+
+// Capture the native world camera before later model and HUD passes change D3D state.
+X86_EXTERN_FUNC(__imp__sub_0002B830);
+X86_FUNC(sub_0002B830) {
+    __imp__sub_0002B830(ctx, base);
+    game::CaptureMultiplayerCamera();
 }

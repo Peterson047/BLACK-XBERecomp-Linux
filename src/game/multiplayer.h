@@ -1,8 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <mutex>
 #include "net/network.h"
 #include "xdk/hle.h"
 
@@ -61,9 +64,14 @@ public:
 
     void Init();
     void Update(float dt);
+    void RequestDirectMapLaunch();
+    bool HasDirectMapLaunchRequest() const;
+    bool ConsumeDirectMapLaunchRequest();
     void DrawOverlay();
     void DrawImGuiMenu();
     void DrawImGuiHUD();
+    void DrawAdminDebug();
+    void NotifyLocalShot(const Vec3& origin, const Vec3& direction, uint32_t weapon);
 
     bool IsInGame() const;
     void TeleportPlayer(const Vec3& pos);
@@ -92,11 +100,19 @@ private:
     void Draw3DPlayerModel(void* draw_list, const Vec3& pos, const Vec3& forward, float yaw, bool is_firing, const char* name, float health);
     void UpdateEnemyPuppet(uint8_t slot_idx, const Vec3& pos, const Vec3& forward, float yaw, float pitch, float move_rate, bool is_crouching);
 
+    uint32_t actor_manager_ = 0;
+    std::unordered_map<uint32_t, uint32_t> native_actor_types_;
+
     float local_health_ = 100.0f;
     uint32_t local_frags_ = 0;
     uint32_t local_deaths_ = 0;
     float total_damage_dealt_ = 0.0f;
-    bool was_firing_ = false;
+    struct LocalShot { Vec3 origin, direction; uint32_t weapon; };
+    std::mutex shots_mutex_;
+    std::vector<LocalShot> local_shots_;
+    std::atomic<uint32_t> pending_shots_{0};
+    std::atomic<uint32_t> confirmed_shots_{0};
+    float shot_flash_timer_ = 0.0f;
     float state_send_timer_ = 0.0f;
     float spawn_protection_timer_ = 0.0f;
 
@@ -113,6 +129,8 @@ private:
     char name_buffer_[32] = "Player 1";
     char chat_buffer_[64] = "";
     bool auto_respawn_ = true;
+    std::atomic<bool> direct_map_launch_requested_{false};
+    bool was_network_connected_ = false;
 };
 
 } // namespace game

@@ -40,6 +40,7 @@ namespace app {
 namespace {
 
 std::atomic<bool> g_open{false};
+std::atomic<bool> g_admin_debug_open{false};
 
 // the cover art's brass on black
 constexpr ImVec4 kPanelBg{0.035f, 0.03f, 0.025f, 0.94f};
@@ -879,11 +880,27 @@ void rows::Defaults(int page) { RestoreDefaults(page); }
 
 bool rows::Enabled(const Row& row) { return row.kind != Kind::Value || !Greyed(row.id); }
 
-bool MenuOpen() { return g_open.load(std::memory_order_relaxed); }
+bool MenuOpen() { return g_open.load(std::memory_order_relaxed) || AdminDebugOpen(); }
+
+bool AdminDebugOpen() { return g_admin_debug_open.load(std::memory_order_relaxed); }
+
+void SetAdminDebugOpen(bool open) {
+    g_admin_debug_open.store(open, std::memory_order_relaxed);
+    if (open) {
+        g_open.store(false, std::memory_order_relaxed);
+        g_capture = -1;
+        g_display_held = false;
+        input::ReleaseCursor();
+    }
+}
 
 bool Capturing() { return g_capture >= 0; }
 
 void ToggleMenu() {
+    if (AdminDebugOpen()) {
+        SetAdminDebugOpen(false);
+        return;
+    }
     bool open = !MenuOpen();
     g_open.store(open, std::memory_order_relaxed);
     g_capture = -1;
@@ -893,6 +910,7 @@ void ToggleMenu() {
 
 void DrawUi(double fps) {
     game::g_fps = float(fps);
+    game::MultiplayerManager::Get().DrawAdminDebug();
     ImGuiIO& io = ImGui::GetIO();
     if (MenuOpen()) io.ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
     else io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
@@ -905,7 +923,7 @@ void DrawUi(double fps) {
     game::MultiplayerManager::Get().Update(dt);
     game::MultiplayerManager::Get().DrawImGuiHUD();
 
-    if (MenuOpen()) {
+    if (g_open.load(std::memory_order_relaxed)) {
         PollCapture();
         DrawPanel();
     }

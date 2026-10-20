@@ -94,7 +94,9 @@ struct RemotePlayer {
     PlayerStateData state{};
     float ping_ms = 0.0f;
     std::chrono::steady_clock::time_point last_seen{};
+    bool has_state = false;
     bool just_fired = false;
+    float shot_flash_left = 0.0f;
 
     // Entity Interpolation (cl_interp GoldSrc style)
     float prev_pos[3]{};
@@ -123,6 +125,14 @@ public:
     void SendHit(uint8_t victim_id, float damage, const float hit_pos[3]);
     void SendChatMessage(const std::string& msg);
 
+    // Host-only authoritative combat/debug controls. These return false on clients.
+    bool SetDamageEnabled(bool enabled);
+    bool SetDamageScale(float scale);
+    bool IsDamageEnabled() const;
+    float GetDamageScale() const;
+    bool AdminHealPlayer(uint8_t player_id);
+    bool AdminResetStats();
+
     NetMode GetMode() const { return mode_; }
     bool IsConnected() const;
     uint8_t GetLocalPlayerId() const { return local_player_id_; }
@@ -144,6 +154,7 @@ private:
     void HandlePacket(const uint8_t* data, size_t size, void* sender_addr, uint32_t addr_len);
     void SendPacket(const void* data, size_t size, void* dest_addr, uint32_t addr_len);
     void CheckTimeouts();
+    void SendAuthoritativeState(uint8_t player_id);
 
     NetMode mode_ = NetMode::Offline;
     int socket_fd_ = -1;
@@ -155,6 +166,8 @@ private:
     float current_ping_ms_ = 0.0f;
     float time_since_last_ping_ = 0.0f;
     float time_since_last_state_broadcast_ = 0.0f;
+    bool damage_enabled_ = true;
+    float damage_scale_ = 1.0f;
 
     void* server_sockaddr_ = nullptr; // For client connecting to host
     uint32_t server_socklen_ = 0;

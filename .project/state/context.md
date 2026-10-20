@@ -1,5 +1,9 @@
 # Session Context
 
-- **Goal**: Implement dedicated Vulkan backend & native Linux host for BLACK-XBERecomp
-- **Phase**: Completed & Verified
-- **Status**: Native Linux binary `BLACK` successfully compiled, linked and verified running with dedicated Vulkan backend and SDL3 platform host.
+- **Goal**: Multiplayer replication/combat and an admin-only in-game debug menu.
+- **Phase**: Incremental implementation and runtime validation.
+- **Implemented**: F8 host-only debug panel (damage toggle/multiplier, heal, reset scores, per-player state, test hit, native actor and confirmed-shot diagnostics). Network HP/frags/deaths are host-owned and echoed to clients. Local shots detected from native magazine decrement. Remote initial state/interpolation and shot pulse expiry corrected.
+- **Validation**: Debug build and diff checks passed. Real POSIX UDP integration test `tests/test_multiplayer_network.cpp` passed. Isolated host `--host 1512 --name DebugValidation` and client `--connect 127.0.0.1:1512 --name DebugClient` used; see logs/admin-debug-runtime.log and logs/admin-debug-client.log. F8 visually opened; final host/client reached gameplay and rendered for more than80/58 seconds respectively without a signal crash. Final host panel screenshot: /tmp/black-admin-debug-host-final.png. Check current logs before claiming session is still running.
+- **Native actor correction**: +79B4 is container capacity, +79B8 used, +79BC data. Preserve both counters. +C4 is component-dispatch category, NOT an enable/team bit. Removed writes that zero category or teleport suppressed actors to9999; both caused native crashes when preserving the real container. Campaign AI suppression is consequently pending and native campaign actors may remain visible/active.
+- **Remaining**: Proven native idle/run/fire clip selection, native ally aim/fire gate, safe independent proxy allocation and bidirectional visibility, geometric/LOS validation and native HUD health/physical respawn. Debug test-hit validates network damage only. Existing Python E2E documents are not evidence of actual engine combat correctness.
+- **Prior loading fixes retained**: original ISO speech.slb table and controller/action-map binding before direct launch.
