@@ -28,6 +28,7 @@
 #include "image_symbols.h"
 #include "kernel/kernel.h"
 #include "net/network.h"
+#include "game/coop_adapter.h"
 #include "game/multiplayer.h"
 
 namespace app {
@@ -120,6 +121,12 @@ void Pace() {
 }  // namespace app
 
 static void CrashHandler(int sig, siginfo_t* info, void* context) {
+    if (sig == SIGTERM || sig == SIGINT) {
+        // The co-op's summary, so the log gate has something to read.
+        game::coop::Adapter::Get().LogSummary();
+        logx::Flush();
+        _exit(0);
+    }
     LOGE("Caught signal %d at host address %p", sig, info ? info->si_addr : nullptr);
 #if defined(__x86_64__) && defined(REG_RIP)
     const auto* uc = static_cast<const ucontext_t*>(context);
@@ -150,9 +157,14 @@ int main(int argc, char** argv) {
     sigaction(SIGSEGV, &crash_action, nullptr);
     sigaction(SIGABRT, &crash_action, nullptr);
     sigaction(SIGFPE, &crash_action, nullptr);
+    // A polite shutdown has to leave the same trace behind as a crash: the
+    // co-op prints its summary, so a test can read the round.
+    sigaction(SIGTERM, &crash_action, nullptr);
+    sigaction(SIGINT, &crash_action, nullptr);
 
     bool relaunched = false;
     bool is_host = false;
+    bool is_coop = false;
     uint16_t host_port = net::kDefaultPort;
     std::string connect_ip = "";
     uint16_t connect_port = net::kDefaultPort;
@@ -177,6 +189,8 @@ int main(int argc, char** argv) {
                     connect_ip = arg;
                 }
             }
+        } else if (std::strcmp(argv[i], "--coop") == 0) {
+            is_coop = true;
         } else if (std::strcmp(argv[i], "--name") == 0 || std::strcmp(argv[i], "--player-name") == 0) {
             if (i + 1 < argc) {
                 player_name = argv[++i];
@@ -192,6 +206,11 @@ int main(int argc, char** argv) {
     else app::LogSystem();
 
     game::MultiplayerManager::Get().Init();
+    if (is_coop) {
+        // The co-op is a session of its own: the same transport, a different
+        // conversation. See .agents/teamwork/coop/MODE.md.
+        game::coop::Adapter::Get().Enable();
+    }
     if (!player_name.empty()) {
         net::NetworkManager::Get().SetLocalPlayerName(player_name);
     }
@@ -272,6 +291,9 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(4));
     }
 
+    // The co-op prints its summary when the game is over, so a test can
+    // read the round without reading the whole log.
+    game::coop::Adapter::Get().LogSummary();
     logx::Flush();
     kernel::Shutdown(0);
     ImGui_ImplSDL3_Shutdown();

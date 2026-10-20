@@ -33,6 +33,7 @@
 #include "common/mouse_keyboard.h"
 #include "common/options.h"
 #include "common/translations.h"
+#include "game/coop_adapter.h"
 #include "game/multiplayer.h"
 
 namespace app {
@@ -920,6 +921,10 @@ void DrawUi(double fps) {
 
     // Multiplayer tick and in-game 3D HUD
     float dt = (fps > 0) ? float(1.0 / fps) : 0.016f;
+    // The co-op shares the tick with the Deathmatch; it does not add a clock.
+    // It goes first, so the role of this process is known before the first
+    // packet of the session is handled.
+    game::coop::Adapter::Get().Tick(dt);
     game::MultiplayerManager::Get().Update(dt);
     game::MultiplayerManager::Get().DrawImGuiHUD();
 

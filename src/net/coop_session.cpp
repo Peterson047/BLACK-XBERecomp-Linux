@@ -178,6 +178,8 @@ void CoopSession::PublishRoom() {
     std::memcpy(&published_, &room.state, sizeof(coop::RoomState));
     room.state.revision = ++revision_;
 
+    LOGI("coop: publish room revision=%u phase=%u epoch=%u", room.state.revision, room.state.phase,
+         room.state.start_epoch);
     uint8_t buffer[sizeof(PacketHeader) + sizeof(coop::RoomState)];
     PacketHeader header{};
     header.magic = kProtocolMagic;

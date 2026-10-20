@@ -27,8 +27,13 @@ fi
 
 RUN_DIR="$(mktemp -d /tmp/coop-run-XXXXXX)"
 cleanup() {
-    [[ -n "${HOST_PID:-}" ]] && kill "$HOST_PID" 2>/dev/null
-    [[ -n "${GUEST_PID:-}" ]] && kill "$GUEST_PID" 2>/dev/null
+    for pid in "${HOST_PID:-}" "${GUEST_PID:-}"; do
+        [[ -n "$pid" ]] && kill -TERM -- "-$pid" 2>/dev/null
+    done
+    sleep 1
+    for pid in "${HOST_PID:-}" "${GUEST_PID:-}"; do
+        [[ -n "$pid" ]] && kill -KILL -- "-$pid" 2>/dev/null
+    done
     [[ -n "${GUEST_XVFB:-}" ]] && kill "$GUEST_XVFB" 2>/dev/null
     [[ -n "${HOST_XVFB:-}" ]] && kill "$HOST_XVFB" 2>/dev/null
     wait 2>/dev/null
@@ -45,19 +50,23 @@ start_instance() {
     Xvfb "$display" -screen 0 1280x720x24 >/dev/null 2>&1 &
     local xvfb_pid=$!
     sleep 1
-    DISPLAY="$display" "$BIN" "$@" >"$RUN_DIR/$name.out" 2>&1 &
+    # The game relaunches itself, so the instance gets its own group and the
+    # whole group has to go when the run ends.
+    setsid env DISPLAY="$display" "$BIN" "$@" >"$RUN_DIR/$name.out" 2>&1 &
     local game_pid=$!
     echo "$xvfb_pid $game_pid"
 }
 
-read -r HOST_XVFB HOST_PID <<<"$(start_instance host ":77" --host "$PORT" --name "$HOST_NAME")"
+read -r HOST_XVFB HOST_PID <<<"$(start_instance host ":77" --coop --host "$PORT" --name "$HOST_NAME")"
 sleep 2
-read -r GUEST_XVFB GUEST_PID <<<"$(start_instance guest ":78" --connect "127.0.0.1:$PORT" --name "$GUEST_NAME")"
+read -r GUEST_XVFB GUEST_PID <<<"$(start_instance guest ":78" --coop --connect "127.0.0.1:$PORT" --name "$GUEST_NAME")"
 
 sleep "$DURATION"
 
-kill "$HOST_PID" "$GUEST_PID" 2>/dev/null
-sleep 1
+# The instances get a polite shutdown, so they print their summary.
+kill -TERM -- "-$HOST_PID" "-$GUEST_PID" 2>/dev/null
+sleep 2
+kill -KILL -- "-$HOST_PID" "-$GUEST_PID" 2>/dev/null
 kill "$HOST_XVFB" "$GUEST_XVFB" 2>/dev/null
 wait 2>/dev/null
 
@@ -84,5 +93,12 @@ for who in host guest; do
     echo "### $who"
     grep -hiE "NetworkManager|MultiplayerManager|Coop:|coop:" "$RUN_DIR/$who.out" 2>/dev/null | tail -25 | sed 's/^/    /'
 done
+echo
+echo "-- the two sides compared --"
+if python3 tests/coop/assert_coop_log.py "$RUN_DIR/host.out" "$RUN_DIR/guest.out"; then
+    echo "the two instances agree"
+else
+    echo "the two instances do not agree yet"
+fi
 echo
 echo "run dir kept at $RUN_DIR"

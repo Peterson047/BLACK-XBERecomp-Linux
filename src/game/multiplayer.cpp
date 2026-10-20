@@ -1,3 +1,4 @@
+#include "game/coop_adapter.h"
 #include "game/multiplayer.h"
 #include "game/layout.h"
 #include "common/aspect.h"
@@ -392,7 +393,11 @@ void MultiplayerManager::CheckLocalPlayerShooting(const Vec3&, const Vec3&, uint
         const float origin[3] = {shot.origin.x, shot.origin.y, shot.origin.z};
         const float dir[3] = {shot.direction.x, shot.direction.y, shot.direction.z};
         net::NetworkManager::Get().BroadcastShoot(origin, dir, shot.weapon);
-        CheckHitDetection(shot.origin, shot.direction, shot.weapon);
+        // The co-op has no player against player: the damage to the campaign
+        // is resolved by the engine and replicated by the world layer.
+        if (!coop::Adapter::Get().IsEnabled()) {
+            CheckHitDetection(shot.origin, shot.direction, shot.weapon);
+        }
         AddTracer(shot.origin, shot.origin + shot.direction * 90.0f);
     }
 }
@@ -411,7 +416,9 @@ void MultiplayerManager::Update(float dt) {
 
     const bool network_connected = network.IsConnected();
     if (network_connected && !was_network_connected_) {
-        RequestDirectMapLaunch();
+        // In the co-op the mission is named by the session, and the level is
+        // loaded when both sides are ready for it.
+        if (!coop::Adapter::Get().IsEnabled()) RequestDirectMapLaunch();
     }
     was_network_connected_ = network_connected;
 
@@ -457,8 +464,9 @@ void MultiplayerManager::Update(float dt) {
     if (!IsInGame()) return;
     if (!net::NetworkManager::Get().IsConnected()) return;
 
-    // Collect initialized native actors for remote proxies.
-    ClearCampaignEnemies();
+    // Collect initialized native actors for remote proxies. In the co-op the
+    // campaign actors are the content of the mission, not bodies to lend out.
+    if (!coop::Adapter::Get().IsEnabled()) ClearCampaignEnemies();
 
     uint32_t p = Player();
     if (!p) return;
@@ -505,7 +513,9 @@ void MultiplayerManager::Update(float dt) {
             float r_yaw = rpl.state.yaw;
             float r_pitch = rpl.state.pitch;
 
-            UpdateEnemyPuppet(puppet_slot++, rpos, rfwd, r_yaw, r_pitch, move_rate, r_crouching);
+            if (!coop::Adapter::Get().IsEnabled()) {
+                UpdateEnemyPuppet(puppet_slot++, rpos, rfwd, r_yaw, r_pitch, move_rate, r_crouching);
+            }
 
             if (rpl.just_fired) {
                 Vec3 end_tr = rpos + (rfwd * 70.0f);

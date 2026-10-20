@@ -23,7 +23,10 @@ import sys
 from pathlib import Path
 
 # coop: verb key=value key=value
-LINE = re.compile(r"^coop:\s+(?P<verb>[a-z]+)\s*(?P<rest>.*)$")
+#
+# The game writes a prefix in front of every line (the time, the level, the
+# thread), so the vocabulary is looked for inside the line, not at its start.
+LINE = re.compile(r"\bcoop:\s+(?P<verb>[a-z]+)\s*(?P<rest>.*)$")
 PAIR = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(\S*)")
 
 # The verbs that carry a round.
@@ -38,7 +41,7 @@ class Log:
         if not self.path.exists():
             raise FileNotFoundError(path)
         for raw in self.path.read_text(errors="replace").splitlines():
-            match = LINE.match(raw.strip())
+            match = LINE.search(raw.strip())
             if not match:
                 continue
             verb = match.group("verb")
