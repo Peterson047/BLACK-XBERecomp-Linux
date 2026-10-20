@@ -130,12 +130,59 @@ run_e2e() {
     return 0
 }
 
+run_coop() {
+    echo "== co-op log checker =="
+    if [[ ! -f tests/coop/test_assert_coop_log.py ]]; then
+        echo "  SKIP: the co-op log checker is not there yet"
+        return 0
+    fi
+    if python3 tests/coop/test_assert_coop_log.py >/tmp/dev_check_coop.txt 2>&1; then
+        echo "  ok   the log checker catches what it should"
+    else
+        echo "  FAIL the log checker"
+        tail -20 /tmp/dev_check_coop.txt | sed 's/^/       /'
+        fail=1
+    fi
+
+    # The two instance gate only makes sense once the co-op code is in the
+    # game. Until then there is nothing for the instances to agree about.
+    if [[ ! -f src/game/coop_world.cpp ]]; then
+        echo "  SKIP: the two instance gate, the co-op code is not in the game yet"
+        return 0
+    fi
+    if [[ ! -x out/build/release/BLACK ]]; then
+        echo "  SKIP: the two instance gate, the game is not built"
+        return 0
+    fi
+    echo "== two instance gate =="
+    if ! tools/coop_run.sh "${COOP_RUN_SECONDS:-45}" "${COOP_RUN_PORT:-15199}" >/tmp/dev_check_run.txt 2>&1; then
+        echo "  FAIL the two instances did not run"
+        tail -20 /tmp/dev_check_run.txt | sed 's/^/       /'
+        fail=1
+        return 0
+    fi
+    local run_dir
+    run_dir="$(grep -o '/tmp/coop-run-[A-Za-z0-9]*' /tmp/dev_check_run.txt | head -1)"
+    if [[ -z "$run_dir" || ! -f "$run_dir/host.out" || ! -f "$run_dir/guest.out" ]]; then
+        echo "  SKIP: the two instance gate, the run produced no logs"
+        return 0
+    fi
+    if python3 tests/coop/assert_coop_log.py "$run_dir/host.out" "$run_dir/guest.out"; then
+        echo "  ok   the two instances agree"
+    else
+        echo "  FAIL the two instances disagree"
+        fail=1
+    fi
+    return 0
+}
+
 case "${1:-all}" in
     syntax) run_syntax ;;
     cpp)    run_cpp ;;
     e2e)    run_e2e ;;
-    all)    run_syntax; run_cpp; run_e2e ;;
-    *)      echo "usage: $0 [all|syntax|cpp|e2e]"; exit 2 ;;
+    coop)   run_coop ;;
+    all)    run_syntax; run_cpp; run_e2e; run_coop ;;
+    *)      echo "usage: $0 [all|syntax|cpp|e2e|coop]"; exit 2 ;;
 esac
 
 if [[ $fail -ne 0 ]]; then
