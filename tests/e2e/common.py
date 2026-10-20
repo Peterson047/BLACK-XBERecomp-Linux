@@ -103,6 +103,12 @@ MSG_SHOOT = 5
 MSG_HIT = 6
 MSG_DISCONNECT = 7
 MSG_CHAT = 8
+# Co-op. The host owns the world and the guest reacts to it.
+MSG_COOP_ROOM = 9
+MSG_COOP_READY = 10
+MSG_COOP_SNAPSHOT = 11
+MSG_COOP_EVENT = 12
+MSG_COOP_ACK = 13
 
 # Binary Packet Struct Formats (little-endian, packed)
 HEADER_FMT = "<IBBHI"  # magic (uint32), type (uint8), player_id (uint8), sequence (uint16), timestamp_ms (uint32)

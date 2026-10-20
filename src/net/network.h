@@ -23,7 +23,16 @@ enum class MsgType : uint8_t {
     Shoot = 5,
     Hit = 6,
     Disconnect = 7,
-    Chat = 8
+    Chat = 8,
+    // Co-op. The host owns the world and the guest reacts to it, so the room,
+    // the snapshot and the world events travel host -> guest, and only the
+    // ready and the acknowledgement travel the other way. The numbers are
+    // mirrored in tests/e2e/common.py and have to change there together.
+    CoopRoom = 9,
+    CoopReady = 10,
+    CoopSnapshot = 11,
+    CoopEvent = 12,
+    CoopAck = 13
 };
 
 #pragma pack(push, 1)

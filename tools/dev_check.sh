@@ -76,7 +76,7 @@ run_cpp() {
     echo "== C++ standalone tests =="
     local tests=(
         "tests/test_multiplayer_network.cpp|src/net/network.cpp"
-        "tests/test_coop_protocol.cpp|src/net/network.cpp|src/net/coop_protocol.cpp"
+        "tests/test_coop_protocol.cpp|src/net/coop_protocol.cpp"
     )
     for entry in "${tests[@]}"; do
         IFS='|' read -r -a parts <<< "$entry"

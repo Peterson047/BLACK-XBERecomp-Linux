@@ -29,8 +29,9 @@ RUN_DIR="$(mktemp -d /tmp/coop-run-XXXXXX)"
 cleanup() {
     [[ -n "${HOST_PID:-}" ]] && kill "$HOST_PID" 2>/dev/null
     [[ -n "${GUEST_PID:-}" ]] && kill "$GUEST_PID" 2>/dev/null
+    [[ -n "${GUEST_XVFB:-}" ]] && kill "$GUEST_XVFB" 2>/dev/null
+    [[ -n "${HOST_XVFB:-}" ]] && kill "$HOST_XVFB" 2>/dev/null
     wait 2>/dev/null
-    rm -rf "$RUN_DIR"
 }
 trap cleanup EXIT
 
@@ -60,26 +61,28 @@ sleep 1
 kill "$HOST_XVFB" "$GUEST_XVFB" 2>/dev/null
 wait 2>/dev/null
 
-# the game rotates its log file, so pick the newest two and label them
-mapfile -t LOGS < <(ls -t "$LOGDIR"/*.log 2>/dev/null | head -2)
-if [[ ${#LOGS[@]} -lt 2 ]]; then
-    echo "no game logs found in $LOGDIR"
-    exit 1
+# The logger mirrors every line to stderr, so each instance's own capture is
+# the complete and correctly attributed log. Identifying the instances by the
+# log file's modification time is a race, so they are told apart by content:
+# the host says it started a server, the guest says it sent a join request.
+for who in host guest; do
+    if [[ -s "$RUN_DIR/$who.out" ]]; then
+        cp "$RUN_DIR/$who.out" "$RUN_DIR/$who.log"
+    fi
+done
+
+if ! grep -q "Server started on port" "$RUN_DIR/host.out" 2>/dev/null; then
+    echo "the host did not report a server; see $RUN_DIR/host.out"
+fi
+if ! grep -q "Sent JoinRequest" "$RUN_DIR/guest.out" 2>/dev/null; then
+    echo "the guest did not report a join request; see $RUN_DIR/guest.out"
 fi
 
-HOST_LOG="${LOGS[0]}"
-GUEST_LOG="${LOGS[1]}"
-cp "$HOST_LOG" "$RUN_DIR/host.log"
-cp "$GUEST_LOG" "$RUN_DIR/guest.log"
-
 echo
-echo "== host log:  $HOST_LOG"
-echo "== guest log: $GUEST_LOG"
-echo
-echo "-- network and multiplayer lines --"
+echo "-- network, multiplayer and coop lines --"
 for who in host guest; do
     echo "### $who"
-    grep -hiE "NetworkManager|MultiplayerManager|Coop|coop" "$RUN_DIR/$who.log" | tail -20 | sed 's/^/    /'
+    grep -hiE "NetworkManager|MultiplayerManager|Coop:|coop:" "$RUN_DIR/$who.out" 2>/dev/null | tail -25 | sed 's/^/    /'
 done
 echo
 echo "run dir kept at $RUN_DIR"
