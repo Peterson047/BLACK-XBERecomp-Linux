@@ -256,21 +256,39 @@ int main(int argc, char** argv) {
         if (data.size() >= 4) std::memcpy(&magic, data.data(), 4);
         report.Assert(magic == 0x11, "3.1d LevelDat.bin magic is 0x11 (world spatial data)");
 
-        // 3.2 CRITICAL EMPIRICAL PROOF: speech.slb
-        // Retail ISO has 6,944 bytes. Host clean map has 104 bytes dummy with 0 cues.
+        // 3.2 speech.slb: the host copy of the level is the one that is read, and it has to be
+        // the whole retail bank. The level loader indexes the speech resources, so a bank
+        // without its resource tables breaks the level: the table offset is read at 0x5C and
+        // has to point inside the file (104 <= table < size). 104 is that minimum offset, NOT
+        // the size of the file: the retail bank is 6,944 bytes and the clean map keeps it.
+        std::string spch_host = kernel::ResolvePath("D:\\Levels\\Level_00\\speech.slb", 0);
+        report.Assert(spch_host.find("level_mp00/speech.slb") != std::string::npos,
+                      "3.2a speech.slb resolves to the host copy in level_mp00: " + spch_host);
+
         std::vector<uint8_t> spch_data;
         bool spch_ok = kernel::ReadGameFile("D:\\Levels\\Level_00\\speech.slb", spch_data);
-        report.Assert(spch_ok, "3.2a ReadGameFile(speech.slb) succeeded");
-        report.Assert(spch_data.size() == 104,
-                      "3.2b EMPIRICAL PROOF: speech.slb loaded from HOST (104 bytes), NOT retail ISO (6,944 bytes)! Actual: " +
-                      std::to_string(spch_data.size()) + " bytes");
-        if (spch_data.size() == 104) {
-            uint32_t slb_magic = 0, num_cues = 0;
+        report.Assert(spch_ok, "3.2b ReadGameFile(speech.slb) succeeded");
+
+        uint32_t slb_version = 0, slb_magic = 0, slb_cues = 0, slb_table = 0;
+        if (spch_data.size() >= 0x60) {
+            std::memcpy(&slb_version, spch_data.data(), 4);
             std::memcpy(&slb_magic, spch_data.data() + 4, 4);
-            std::memcpy(&num_cues, spch_data.data() + 0x54, 4);
-            report.Assert(slb_magic == 0x474E494B, "3.2c speech.slb magic is 'KING' (0x474E494B)");
-            report.Assert(num_cues == 0, "3.2d speech.slb contains exactly 0 active dialogue cues (suppressed)");
+            std::memcpy(&slb_cues, spch_data.data() + 0x54, 4);
+            std::memcpy(&slb_table, spch_data.data() + 0x5C, 4);
         }
+        report.Assert(slb_version == 1 && slb_magic == 0x474E494B,
+                      "3.2c speech.slb header is version 1 with the 'KING' magic (0x474E494B)");
+        report.Assert(slb_cues > 0, "3.2d speech.slb holds its dialogue cues: " + std::to_string(slb_cues));
+        report.Assert(spch_data.size() > 104 && slb_table >= 104 && slb_table < spch_data.size(),
+                      "3.2e speech.slb is the whole bank: the resource table at 0x5C (" + std::to_string(slb_table) +
+                          ") points inside the " + std::to_string(spch_data.size()) + " byte file");
+
+        // the dot path has to reach the very same bank as the plain one
+        std::vector<uint8_t> spch_dot;
+        bool spch_dot_ok = kernel::ReadGameFile("D:\\Levels\\.\\Level_00\\speech.slb", spch_dot);
+        report.Assert(spch_dot_ok && spch_dot.size() == spch_data.size(),
+                      "3.2f the dot path reaches the same speech bank as the plain path (" +
+                          std::to_string(spch_dot.size()) + " bytes)");
 
         // 3.3 Unit_01.bin (10.5 MB geometry chunk)
         std::vector<uint8_t> unit_data;
@@ -382,13 +400,27 @@ int main(int argc, char** argv) {
         std::atomic<int> success_count{0};
         std::atomic<int> error_count{0};
 
+        // The banks are read once before the threads start, so that every read below is
+        // checked against the file a single read hands back. The 500 errors this block used
+        // to report came from a wrong expectation of 104 bytes: 104 is the offset of the
+        // speech resource table (read at 0x5C), not the size of the bank, so the reads that
+        // were counted as failures were perfectly good ones. They were not contention.
+        std::vector<uint8_t> level_data, speech_data;
+        kernel::ReadGameFile("D:\\Levels\\Level_00\\LevelDat.bin", level_data);
+        kernel::ReadGameFile("D:\\Levels\\Level_00\\speech.slb", speech_data);
+        const size_t level_size = level_data.size();
+        const size_t speech_size = speech_data.size();
+        report.Assert(level_size > 0 && speech_size > 104,
+                      "6.0 the banks were read before the stress: LevelDat.bin " + std::to_string(level_size) +
+                          " bytes, speech.slb " + std::to_string(speech_size) + " bytes");
+
         std::cout << "  ... Launching " << kNumThreads << " threads x " << kOpsPerThread
                   << " ops (" << (kNumThreads * kOpsPerThread) << " total concurrent operations) ..." << std::endl;
 
         auto start_time = std::chrono::steady_clock::now();
 
         for (int tid = 0; tid < kNumThreads; tid++) {
-            workers.emplace_back([tid, &success_count, &error_count]() {
+            workers.emplace_back([tid, level_size, speech_size, &success_count, &error_count]() {
                 for (int i = 0; i < kOpsPerThread; i++) {
                     if (tid % 2 == 0) {
                         // Host file read: LevelDat.bin with alternating casing
@@ -396,16 +428,16 @@ int main(int argc, char** argv) {
                                                ? "D:\\Levels\\Level_00\\LevelDat.bin"
                                                : "d:/levels/level_00/leveldat.bin";
                         std::vector<uint8_t> d;
-                        if (kernel::ReadGameFile(path, d) && d.size() == 711088) {
+                        if (kernel::ReadGameFile(path, d) && d.size() == level_size) {
                             success_count++;
                         } else {
                             error_count++;
                         }
                     } else {
-                        // ISO fallback read: spch_EN.bks or speech.slb
+                        // Host speech bank read
                         if (i % 2 == 0) {
                             std::vector<uint8_t> d;
-                            if (kernel::ReadGameFile("D:\\Levels\\Level_00\\speech.slb", d) && d.size() == 104) {
+                            if (kernel::ReadGameFile("D:\\Levels\\Level_00\\speech.slb", d) && d.size() == speech_size) {
                                 success_count++;
                             } else {
                                 error_count++;

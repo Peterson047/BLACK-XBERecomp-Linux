@@ -77,6 +77,9 @@ run_cpp() {
     local tests=(
         "tests/test_multiplayer_network.cpp|src/net/network.cpp"
         "tests/test_coop_protocol.cpp|src/net/coop_protocol.cpp"
+        "tests/test_coop_session.cpp|src/net/network.cpp|src/net/coop_protocol.cpp|src/net/coop_session.cpp"
+        "tests/test_coop_world.cpp"
+        "tests/test_coop_mission.cpp|src/game/coop_mission_logic.cpp"
     )
     for entry in "${tests[@]}"; do
         IFS='|' read -r -a parts <<< "$entry"

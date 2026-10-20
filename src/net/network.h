@@ -119,6 +119,11 @@ enum class NetMode {
     Client
 };
 
+// What the session needs from the transport to carry the co-op packets.
+// The handler lives in coop_session.h; the transport only knows that some
+// object wants the co-op packets and wants to send them.
+class CoopHandler;
+
 class NetworkManager {
 public:
     static NetworkManager& Get();
@@ -133,6 +138,21 @@ public:
     void BroadcastShoot(const float origin[3], const float dir[3], uint32_t weapon_id);
     void SendHit(uint8_t victim_id, float damage, const float hit_pos[3]);
     void SendChatMessage(const std::string& msg);
+
+    // Co-op. The transport carries the packets and does not know what they
+    // mean: the session does.
+    void SetCoopHandler(CoopHandler* handler) { coop_handler_ = handler; }
+    // How long a peer may be quiet before it is dropped. The session raises
+    // this while a level is loading, because a peer that is loading does not
+    // answer for several seconds.
+    void SetPeerTimeout(float seconds) { peer_timeout_ = seconds; }
+    float GetPeerTimeout() const { return peer_timeout_; }
+    // Host to every client.
+    void BroadcastCoop(const void* data, size_t size);
+    // Client to the host.
+    void SendCoopToHost(const void* data, size_t size);
+    // A bit per player that is in the session, the host included.
+    uint8_t GetPresentMask() const;
 
     // Host-only authoritative combat/debug controls. These return false on clients.
     bool SetDamageEnabled(bool enabled);
@@ -164,6 +184,7 @@ private:
     void SendPacket(const void* data, size_t size, void* dest_addr, uint32_t addr_len);
     void CheckTimeouts();
     void SendAuthoritativeState(uint8_t player_id);
+    void SendJoinRequest();
 
     NetMode mode_ = NetMode::Offline;
     int socket_fd_ = -1;
@@ -175,13 +196,21 @@ private:
     float current_ping_ms_ = 0.0f;
     float time_since_last_ping_ = 0.0f;
     float time_since_last_state_broadcast_ = 0.0f;
+    float time_since_last_join_ = 0.0f;
     bool damage_enabled_ = true;
     float damage_scale_ = 1.0f;
+
+    // Co-op. The transport carries the packets; the session gives them meaning.
+    CoopHandler* coop_handler_ = nullptr;
+    float peer_timeout_ = kTimeoutSeconds;
 
     void* server_sockaddr_ = nullptr; // For client connecting to host
     uint32_t server_socklen_ = 0;
 
-    mutable std::mutex mutex_;
+    // Recursive: the transport calls the co-op handler while the lock is
+    // held, and the handler calls back into the transport to send and to ask
+    // who is in the room.
+    mutable std::recursive_mutex mutex_;
     std::array<RemotePlayer, kMaxPlayers> players_{};
     std::vector<std::string> event_logs_;
 

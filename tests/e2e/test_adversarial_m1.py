@@ -10,11 +10,12 @@ Covers:
 3. Re-extraction idempotency & in-place corruption recovery
 4. CLI parameter validation (--verify-only, --include-ambience, --no-destruction, --dest-name, invalid args)
 5. Deep binary integrity (Unit_01.bin item offsets, Collide.awd GUID & TOC, LevelDat.bin, StLevel.bin,
-   StUnit01.bin GAME_RIG, guns.bin LODs, dummy speech.slb cue count, fpguns pairs, campaign exclusion).
+   StUnit01.bin GAME_RIG, guns.bin LODs, speech.slb resource tables, fpguns pairs, campaign exclusion).
 """
 
 import hashlib
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -184,7 +185,11 @@ class TestAdversarialCliParameters(unittest.TestCase):
         rc, out, err = run_extractor("--verify-only", "--out", str(MP00_DIR))
         self.assertEqual(rc, 0, f"verify-only failed on valid assets: {out}")
         self.assertIn("[PASS] Unit_01.bin", out)
-        self.assertIn("[PASS] speech.slb dummy valid", out)
+        # the speech bank is the retail one: the loader indexes its resource tables, so the
+        # extractor refuses a package without them
+        match = re.search(r"\[PASS\] speech\.slb retains (\d+) resource entries", out)
+        self.assertIsNotNone(match, f"the speech bank was not verified: {out}")
+        self.assertGreater(int(match.group(1)), 0, "the speech bank has to keep its resource entries")
         self.assertIn("[PASS] fpguns/ contains 16 .db and 16 .wdd weapon files", out)
 
     def test_adv_cli_verify_only_fail_missing_dir(self):
@@ -229,7 +234,7 @@ class TestAdversarialCliParameters(unittest.TestCase):
             self.assertEqual(rc_v, 0)
 
     def test_adv_cli_custom_dest_name(self):
-        """--dest-name custom_mp overrides internal prefix in dummy speech.slb."""
+        """--dest-name is accepted and the package keeps the retail speech bank."""
         if not ISO_PATH.is_file():
             self.skipTest(f"Black.iso not found at {ISO_PATH}")
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -237,8 +242,12 @@ class TestAdversarialCliParameters(unittest.TestCase):
             rc, out, err = run_extractor("--iso", str(ISO_PATH), "--out", str(out_path), "--dest-name", "custom_arena")
             self.assertEqual(rc, 0)
             slb_bytes = (out_path / "speech.slb").read_bytes()
+            # the bank is the retail one, copied as it is: it names the level it was taken
+            # from, and the resource table it holds has to point inside the file
             prefix = slb_bytes[0x10:0x50].split(b"\x00")[0].decode("ascii")
-            self.assertEqual(prefix, "levels/custom_arena/speech")
+            self.assertEqual(prefix, "levels/level_00/speech")
+            table, = struct.unpack_from("<I", slb_bytes, 0x5C)
+            self.assertTrue(104 <= table < len(slb_bytes), "the resource table has to be inside the bank")
 
 
 class TestAdversarialExtractedAssetsIntegrity(unittest.TestCase):
@@ -374,26 +383,29 @@ class TestAdversarialExtractedAssetsIntegrity(unittest.TestCase):
                 self.assertEqual(magic, 0x809)
                 self.assertEqual(hdr_sz, 0x2C)
 
-    def test_adv_binary_dummy_speech_slb_deep(self):
-        """speech.slb: 104 bytes, magic KING, version 1, prefix levels/level_mp00/speech, 0 cues."""
+    def test_adv_binary_speech_slb_retail_bank(self):
+        """speech.slb: the retail bank, magic KING, version 1, its resource tables inside the file.
+
+        The extractor keeps the retail speech.slb on purpose: the level loader indexes the
+        resource tables, so a bank without them breaks the level. 104 is the size of the
+        bank header, the offset the resource table is read at, NOT the size of the file.
+        """
         slb_path = MP00_DIR / "speech.slb"
         self.assertTrue(slb_path.is_file())
         data = slb_path.read_bytes()
-        self.assertEqual(len(data), 104)
+        self.assertGreater(len(data), 104, "The bank is not a truncated header")
 
         ver, magic = struct.unpack_from("<I4s", data, 0)
         self.assertEqual(ver, 1)
         self.assertEqual(magic, b"KING")
 
         prefix = data[0x10:0x50].split(b"\x00")[0].decode("ascii")
-        self.assertEqual(prefix, "levels/level_mp00/speech")
+        self.assertEqual(prefix, "levels/level_00/speech")
 
         c50, cues, off58, off5c, hdr_sz, res = struct.unpack_from("<6I", data, 0x50)
-        self.assertEqual(c50, 0, "Table1 count must be 0 to bypass relocation loop 1")
-        self.assertEqual(cues, 0, "Cue count must be 0 to bypass relocation loop 2")
-        self.assertEqual(off58, 0, "Table1 offset must be 0")
-        self.assertEqual(off5c, 0, "Cue table offset must be 0")
-        self.assertEqual(hdr_sz, 104, "Header size must match buffer length")
+        self.assertGreater(cues, 0, "The bank has to keep its cues")
+        self.assertEqual(hdr_sz, 104, "Header size must match the offset of the resource table")
+        self.assertTrue(104 <= off5c < len(data), "The resource table has to point inside the bank")
 
     def test_adv_binary_fpguns_weapons_catalogue(self):
         """fpguns/ contains exactly 16 .db and 16 .wdd weapon files, all non-empty."""

@@ -87,4 +87,83 @@ inline bool InputTaken(uint32_t ui) {
     return G<uint8_t>(ui + kUiReady) && G<uint8_t>(ui + kInputOn) && !G<uint8_t>(ui + kInputHeldOff);
 }
 
+// The co-op world: the manager of the actors and the actors themselves.
+// Every offset here is proved in .agents/teamwork/coop/LAYOUT.md.
+namespace coop {
+
+// the manager of the actors
+constexpr uint32_t kActorManager = 0x2D1980;
+// its live list: the array of the actor pointers, how many of them are in
+// use and how many slots the array has
+constexpr uint32_t kActorList = 0x79BC;
+constexpr uint32_t kActorCount = 0x79B8;
+constexpr uint32_t kActorCapacity = 0x79B4;
+// the actor
+constexpr uint32_t kActorVtable = 0x28C1E8;
+constexpr uint32_t kActorKeyA = 0x08;   // the engine's object key, first half
+constexpr uint32_t kActorKeyB = 0x0C;   // the engine's object key, second half
+constexpr uint32_t kActorType = 0xC4;
+constexpr uint32_t kActorGeneration = 0x374;
+constexpr uint32_t kActorHealth = 0x2F0;   // float
+constexpr uint32_t kActorState = 0x384;    // 0 alive, 1 recycled, 2 dead
+constexpr uint32_t kActorPosition = 0xA0;  // x, y, z: the matrix's last row
+constexpr uint32_t kActorDirection = 0x20; // the world direction the engine keeps
+constexpr uint32_t kActorLocalDirection = 0x60;  // the direction in the actor's own frame
+constexpr uint32_t kActorBasis = 0x70;           // the matrix's three rows: 0x70, 0x80, 0x90
+
+// the engine's own calls the world layer drives
+constexpr uint32_t kSetDirection = 0x001CE600;  // the actor's direction
+constexpr uint32_t kSetPosition = 0x001CE660;   // the actor's position
+constexpr uint32_t kDamageMethod = 0x001DF830;  // the actor's damage
+constexpr uint32_t kActorTick = 0x001F08D0;     // the actor's tick, once a frame
+
+// the damage event the engine hands to the damage routine: the origin, the
+// damage, the radius, the type and the flag
+constexpr uint32_t kDamageEventOrigin = 0x00;
+constexpr uint32_t kDamageEventDamage = 0x10;
+constexpr uint32_t kDamageEventRadius = 0x14;
+constexpr uint32_t kDamageEventType = 0x18;
+constexpr uint32_t kDamageEventFlag = 0x1C;
+constexpr uint32_t kDamageEventSize = 0x28;
+
+// The mission. The objective table lives in the world container and the named
+// events of the level script travel in a bus. The proof of each offset is in
+// .agents/teamwork/coop/LAYOUT.md, section 7.
+// the bus of the named events
+constexpr uint32_t kEventBus = 0x2D45D8;
+// the bus: the queue of the events, of eight places
+constexpr uint32_t kEventQueueTail = 0x1964;   // the place the next event goes to
+constexpr uint32_t kEventQueueHead = 0x1966;   // the place the next event is read from
+constexpr uint32_t kEventQueueCount = 0x1968;  // the number of the events in the queue
+constexpr uint32_t kEventQueueSlot = 0x100;    // the stride of a place
+constexpr uint32_t kEventQueueCounts = 0x9C0;  // the count of a place
+constexpr uint32_t kEventQueuePos = 0x940;     // the position of a place
+constexpr uint32_t kEventQueueName = 0x10E4;   // the name of a place
+constexpr uint32_t kEventQueueText = 0x1164;   // the text of a place
+constexpr uint32_t kEventQueueNames = 0xCE8;   // the table of the names of the bus, eleven of them
+// the objective table, in the world container
+constexpr uint32_t kObjectiveTable = 0x930;    // the objectives
+constexpr uint32_t kObjectiveCount = 0x934;    // how many
+constexpr uint32_t kObjectiveCounters = 0x938; // the counters of the categories, six of them
+constexpr uint32_t kObjectiveCounterCount = 6;
+constexpr uint32_t kObjectiveRecord = 0x0C;    // the size of an objective
+constexpr uint32_t kObjectiveState = 0x08;     // in an objective: the live state, 3 is done
+constexpr uint32_t kObjectiveDone = 3;
+// the screen of the end of the level: the names of the lines and their values
+constexpr uint32_t kEndScreenLabels = 0x2AB820;
+constexpr uint32_t kEndScreenValues = 0x2E79C8;
+constexpr uint32_t kEndScreenSlot = 0x200;  // the stride of a line
+// the requests of "use": the list of the objects the player used
+constexpr uint32_t kUseRequests = 0x2D12D0;  // the manager of the requests
+constexpr uint32_t kUseRequestSlots = 36;    // how many places the list has
+constexpr uint32_t kUseRequestFirst = 0x20;  // the first place of the list
+constexpr uint32_t kUseRequestSize = 0x30;   // the size of a place
+// the engine's own calls the mission layer drives
+constexpr uint32_t kFireEvent = 0x0012B8E0;    // the level script fires a named event
+constexpr uint32_t kQueueEvent = 0x0012B790;   // the bus takes an event
+constexpr uint32_t kUseRequest = 0x001BAA40;   // the "use" of an object is registered
+constexpr uint32_t kFrameTick = 0x000BE550;    // the frame counter
+
+}  // namespace coop
+
 }  // namespace layout

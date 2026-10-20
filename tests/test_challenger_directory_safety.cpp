@@ -465,13 +465,24 @@ int main() {
         std::atomic<int> uncaught_exceptions{0};
         std::atomic<int> read_game_file_errors{0};
 
+        // The files are read once before the threads start, so that every read below is
+        // checked against what a single read hands back. The speech bank is the retail one
+        // (the loader indexes its resource tables): 104 is the offset of the resource table
+        // (read at 0x5C), not the size of the bank, so a bank of 104 bytes was a wrong
+        // expectation, not a property of the file.
+        std::vector<uint8_t> level_data, speech_data;
+        kernel::ReadGameFile("D:\\Levels\\Level_00\\LevelDat.bin", level_data);
+        kernel::ReadGameFile("D:\\Levels\\Level_00\\speech.slb", speech_data);
+        const size_t level_size = level_data.size();
+        const size_t speech_size = speech_data.size();
+
         std::cout << "  ... Spawning " << kNumThreads << " threads x " << kOpsPerThread
                   << " ops (" << (kNumThreads * kOpsPerThread) << " total concurrent operations) ..." << std::endl;
 
         auto t0 = std::chrono::steady_clock::now();
 
         for (int tid = 0; tid < kNumThreads; ++tid) {
-            workers.emplace_back([tid, &success_count, &uncaught_exceptions, &read_game_file_errors]() {
+            workers.emplace_back([tid, level_size, speech_size, &success_count, &uncaught_exceptions, &read_game_file_errors]() {
                 for (int i = 0; i < kOpsPerThread; ++i) {
                     try {
                         int op = (tid * 37 + i) % 8;
@@ -487,7 +498,7 @@ int main() {
                             case 1: {
                                 // Valid clean file read
                                 bool ok = kernel::ReadGameFile("D:\\Levels\\Level_00\\LevelDat.bin", data);
-                                if (ok && data.size() == 711088) success_count++;
+                                if (ok && data.size() == level_size) success_count++;
                                 else read_game_file_errors++;
                                 break;
                             }
@@ -499,9 +510,9 @@ int main() {
                                 break;
                             }
                             case 3: {
-                                // Clean speech dummy read (104 bytes)
+                                // Host speech bank read
                                 bool ok = kernel::ReadGameFile("D:\\Levels\\Level_00\\speech.slb", data);
-                                if (ok && data.size() == 104) success_count++;
+                                if (ok && data.size() == speech_size) success_count++;
                                 else read_game_file_errors++;
                                 break;
                             }

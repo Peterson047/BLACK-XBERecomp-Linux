@@ -1,4 +1,5 @@
 #include "net/network.h"
+#include "net/coop_session.h"
 #include "core/log.h"
 
 #include <cstring>
@@ -110,13 +111,15 @@ NetworkManager::~NetworkManager() {
 bool NetworkManager::IsConnected() const {
     if (mode_ == NetMode::Offline) return false;
     if (mode_ == NetMode::Host) return true;
-    if (mode_ == NetMode::Client) return local_player_id_ != 0;
+    // A client that has not been given an id yet is not connected: 255 is
+    // the "unassigned" the join request carries.
+    if (mode_ == NetMode::Client) return local_player_id_ != 0 && local_player_id_ != 255;
     return false;
 }
 
 bool NetworkManager::StartHost(uint16_t port) {
     Disconnect();
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     port_ = port;
     socket_fd_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -161,7 +164,7 @@ bool NetworkManager::StartHost(uint16_t port) {
 
 bool NetworkManager::ConnectTo(const std::string& host_ip, uint16_t port) {
     Disconnect();
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     host_ip_ = host_ip;
     port_ = port;
@@ -188,7 +191,18 @@ bool NetworkManager::ConnectTo(const std::string& host_ip, uint16_t port) {
     mode_ = NetMode::Client;
     local_player_id_ = 255; // Unassigned until Ack
 
-    // Send Join Request
+    time_since_last_join_ = 0.0f;
+    SendJoinRequest();
+
+    LogEvent("Connecting to " + host_ip + ":" + std::to_string(port) + "...");
+    LOGI("NetworkManager: Sent JoinRequest to %s:%u", host_ip.c_str(), port);
+    return true;
+}
+
+// The join request goes out again until the host answers. A datagram that
+// arrives before the host is up is simply lost.
+void NetworkManager::SendJoinRequest() {
+    if (mode_ != NetMode::Client || socket_fd_ < 0 || !server_sockaddr_) return;
     PacketJoinRequest req{};
     req.header.magic = kProtocolMagic;
     req.header.type = static_cast<uint8_t>(MsgType::JoinRequest);
@@ -196,16 +210,12 @@ bool NetworkManager::ConnectTo(const std::string& host_ip, uint16_t port) {
     req.header.sequence = ++sequence_counter_;
     req.header.timestamp_ms = GetTimeMs();
     std::strncpy(req.player_name, local_player_name_.c_str(), sizeof(req.player_name) - 1);
-
     SendPacket(&req, sizeof(req), server_sockaddr_, server_socklen_);
-
-    LogEvent("Connecting to " + host_ip + ":" + std::to_string(port) + "...");
-    LOGI("NetworkManager: Sent JoinRequest to %s:%u", host_ip.c_str(), port);
-    return true;
+    LOGI("NetworkManager: Sent JoinRequest to %s:%u", host_ip_.c_str(), port_);
 }
 
 void NetworkManager::Disconnect() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (mode_ != NetMode::Offline && socket_fd_ >= 0) {
         if (mode_ == NetMode::Client && local_player_id_ != 255) {
             PacketHeader disc{};
@@ -239,13 +249,38 @@ void NetworkManager::LogEvent(const std::string& msg) {
     }
 }
 
+// Co-op. The host sends to every client; the client sends to the host.
+void NetworkManager::BroadcastCoop(const void* data, size_t size) {
+    if (mode_ != NetMode::Host) return;
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    for (size_t i = 1; i < kMaxPlayers; ++i) {
+        if (host_clients_[i].active) {
+            SendPacket(data, size, host_clients_[i].raw_addr, host_clients_[i].addr_len);
+        }
+    }
+}
+
+void NetworkManager::SendCoopToHost(const void* data, size_t size) {
+    if (mode_ != NetMode::Client || !server_sockaddr_) return;
+    SendPacket(data, size, server_sockaddr_, server_socklen_);
+}
+
+uint8_t NetworkManager::GetPresentMask() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    uint8_t mask = 0;
+    for (size_t i = 0; i < kMaxPlayers; ++i) {
+        if (players_[i].active) mask |= static_cast<uint8_t>(1u << i);
+    }
+    return mask;
+}
+
 std::vector<std::string> NetworkManager::GetEventLogs() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     return event_logs_;
 }
 
 std::vector<RemotePlayer> NetworkManager::GetPlayers() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<RemotePlayer> result;
     for (size_t i = 0; i < kMaxPlayers; ++i) {
         if (players_[i].active) {
@@ -259,7 +294,7 @@ void NetworkManager::Update(float dt) {
     if (mode_ == NetMode::Offline) return;
 
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
         for (auto& p : players_) {
             if (p.active) {
                 p.interp_alpha = std::min(1.0f, p.interp_alpha + dt * 30.0f);
@@ -271,6 +306,17 @@ void NetworkManager::Update(float dt) {
 
     ProcessIncomingPackets();
     CheckTimeouts();
+
+    // A client that has not been given an id yet keeps asking. The join
+    // request is a datagram: if the host was not up yet, or the answer was
+    // lost, the request has to be sent again.
+    if (mode_ == NetMode::Client && local_player_id_ == 255) {
+        time_since_last_join_ += dt;
+        if (time_since_last_join_ >= 0.5f) {
+            time_since_last_join_ = 0.0f;
+            SendJoinRequest();
+        }
+    }
 
     time_since_last_ping_ += dt;
     if (time_since_last_ping_ >= 1.0f) {
@@ -309,13 +355,37 @@ void NetworkManager::HandlePacket(const uint8_t* data, size_t size, void* sender
     const auto* hdr = reinterpret_cast<const PacketHeader*>(data);
     if (hdr->magic != kProtocolMagic) return;
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     const auto* sa = reinterpret_cast<const sockaddr*>(sender_addr);
 
     MsgType type = static_cast<MsgType>(hdr->type);
 
     if (mode_ == NetMode::Host) {
         // HOST PACKET HANDLING
+        if (type == MsgType::CoopReady || type == MsgType::CoopAck) {
+            if (!coop_handler_) return;
+            // A guest is known by the address its packet came from, never by
+            // the player id it claims. A stranger that knows the protocol
+            // must not be able to speak for a peer.
+            uint8_t sender_id = 0;
+            bool known = false;
+            for (size_t i = 1; i < kMaxPlayers; ++i) {
+                if (host_clients_[i].active &&
+                    SockAddrEqual(sa, reinterpret_cast<const sockaddr*>(host_clients_[i].raw_addr))) {
+                    sender_id = host_clients_[i].id;
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) return;
+            if (type == MsgType::CoopReady) {
+                coop_handler_->OnCoopReady(sender_id, data + sizeof(PacketHeader), size - sizeof(PacketHeader));
+            } else {
+                coop_handler_->OnCoopAck(sender_id, data + sizeof(PacketHeader), size - sizeof(PacketHeader));
+            }
+            return;
+        }
+
         if (type == MsgType::JoinRequest) {
             if (size < sizeof(PacketJoinRequest)) return;
             const auto* req = reinterpret_cast<const PacketJoinRequest*>(data);
@@ -494,6 +564,17 @@ void NetworkManager::HandlePacket(const uint8_t* data, size_t size, void* sender
     } else if (mode_ == NetMode::Client) {
         // CLIENT PACKET HANDLING
         if (!server_sockaddr_ || !SockAddrEqual(sa, reinterpret_cast<const sockaddr*>(server_sockaddr_))) return;
+        if (type == MsgType::CoopRoom || type == MsgType::CoopSnapshot || type == MsgType::CoopEvent) {
+            if (!coop_handler_) return;
+            if (type == MsgType::CoopRoom) {
+                coop_handler_->OnCoopRoom(data + sizeof(PacketHeader), size - sizeof(PacketHeader));
+            } else if (type == MsgType::CoopSnapshot) {
+                coop_handler_->OnCoopSnapshot(data + sizeof(PacketHeader), size - sizeof(PacketHeader));
+            } else {
+                coop_handler_->OnCoopEvent(data + sizeof(PacketHeader), size - sizeof(PacketHeader));
+            }
+            return;
+        }
         if (type == MsgType::JoinAck) {
             if (size < sizeof(PacketJoinAck)) return;
             const auto* ack = reinterpret_cast<const PacketJoinAck*>(data);
@@ -583,7 +664,7 @@ void NetworkManager::CheckTimeouts() {
         for (size_t i = 1; i < kMaxPlayers; ++i) {
             if (host_clients_[i].active) {
                 float elapsed = std::chrono::duration<float>(now - host_clients_[i].last_seen).count();
-                if (elapsed > kTimeoutSeconds) {
+                if (elapsed > peer_timeout_) {
                     LogEvent(players_[i].name + " timed out");
                     LOGI("NetworkManager: Client %u timed out", static_cast<uint32_t>(i));
                     host_clients_[i] = HostClient{};
@@ -593,7 +674,7 @@ void NetworkManager::CheckTimeouts() {
         }
     } else if (mode_ == NetMode::Client && IsConnected()) {
         float elapsed = std::chrono::duration<float>(now - players_[0].last_seen).count();
-        if (elapsed > kTimeoutSeconds * 2.0f && players_[0].active) {
+        if (elapsed > peer_timeout_ * 2.0f && players_[0].active) {
             LogEvent("Connection to server lost (timeout)");
             Disconnect();
         }
@@ -727,7 +808,7 @@ void NetworkManager::SendAuthoritativeState(uint8_t player_id) {
 }
 
 bool NetworkManager::SetDamageEnabled(bool enabled) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (mode_ != NetMode::Host) return false;
     damage_enabled_ = enabled;
     LogEvent(std::string("Host ") + (enabled ? "enabled" : "disabled") + " damage");
@@ -736,7 +817,7 @@ bool NetworkManager::SetDamageEnabled(bool enabled) {
 
 bool NetworkManager::SetDamageScale(float scale) {
     if (!std::isfinite(scale)) return false;
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (mode_ != NetMode::Host) return false;
     damage_scale_ = std::clamp(scale, 0.0f, 10.0f);
     LogEvent("Host set damage scale to " + std::to_string(damage_scale_));
@@ -744,17 +825,17 @@ bool NetworkManager::SetDamageScale(float scale) {
 }
 
 bool NetworkManager::IsDamageEnabled() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     return damage_enabled_;
 }
 
 float NetworkManager::GetDamageScale() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     return damage_scale_;
 }
 
 bool NetworkManager::AdminHealPlayer(uint8_t player_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (mode_ != NetMode::Host || player_id >= kMaxPlayers || !players_[player_id].active) return false;
     players_[player_id].state.health = 100.0f;
     LogEvent("Host healed " + players_[player_id].name);
@@ -763,7 +844,7 @@ bool NetworkManager::AdminHealPlayer(uint8_t player_id) {
 }
 
 bool NetworkManager::AdminResetStats() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (mode_ != NetMode::Host) return false;
     for (uint8_t i = 0; i < kMaxPlayers; ++i) {
         if (!players_[i].active) continue;

@@ -20,38 +20,37 @@ def get_native_test_binary_path() -> Path:
     return REPO_ROOT / "tests" / "test_adversarial_redirection"
 
 
+# The native harness is built from the SDK sources of this tree, every time. It used to be
+# linked against the object files of an earlier build, so it could run against a kernel that
+# was not the one in the tree, and it used to be a binary committed to the repository, which
+# nobody could reproduce.
+NATIVE_HARNESS_SOURCES = (
+    "tests/test_adversarial_redirection.cpp",
+    "sdk/runtime/kernel/files.cpp",
+    "sdk/runtime/kernel/disc.cpp",
+    "sdk/runtime/core/log.cpp",
+)
+
+_native_harness_built = False
+
+
 def ensure_native_test_binary() -> Path:
-    """Ensures tests/test_adversarial_redirection exists and is up to date."""
+    """Builds the native harness from the SDK sources and returns the path of the binary."""
+    global _native_harness_built
     bin_path = get_native_test_binary_path()
-    cpp_src = REPO_ROOT / "tests" / "test_adversarial_redirection.cpp"
-    obj_files = [
-        REPO_ROOT / "out/build/release/CMakeFiles/Black.dir/sdk/runtime/kernel/files.cpp.o",
-        REPO_ROOT / "out/build/release/CMakeFiles/Black.dir/sdk/runtime/kernel/disc.cpp.o",
-        REPO_ROOT / "out/build/release/CMakeFiles/Black.dir/sdk/runtime/core/log.cpp.o",
+    if _native_harness_built:
+        return bin_path
+    cmd = [
+        "g++", "-std=c++20", "-O2",
+        "-I", str(REPO_ROOT / "src"),
+        "-I", str(REPO_ROOT / "sdk" / "runtime"),
+        *[str(REPO_ROOT / src) for src in NATIVE_HARNESS_SOURCES],
+        "-o", str(bin_path)
     ]
-    stale = not bin_path.exists()
-    if not stale:
-        bin_mtime = bin_path.stat().st_mtime
-        if cpp_src.stat().st_mtime > bin_mtime:
-            stale = True
-        for obj in obj_files:
-            if obj.exists() and obj.stat().st_mtime > bin_mtime:
-                stale = True
-                break
-    if stale:
-        if not all(obj.exists() for obj in obj_files):
-            raise RuntimeError("Cannot compile native test harness: missing object files in out/build/release/")
-        cmd = [
-            "g++", "-std=c++20", "-O2",
-            "-I", str(REPO_ROOT / "src"),
-            "-I", str(REPO_ROOT / "sdk" / "runtime"),
-            str(cpp_src),
-            *[str(o) for o in obj_files],
-            "-o", str(bin_path)
-        ]
-        res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True)
-        if res.returncode != 0:
-            raise RuntimeError(f"Failed to compile native test harness:\n{res.stderr}")
+    res = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"Failed to compile native test harness:\n{res.stderr}")
+    _native_harness_built = True
     return bin_path
 
 

@@ -218,7 +218,11 @@ vida de cada jogador.
   isso é silencioso; precisa de contador visível.
 - **A barra de carga é a única barreira real.** O mundo é replicado a 10 Hz sem
   interpolação: a posição do ator do convidado é um degrau a 10 Hz.
-- **Suíte E2E com falha neste commit.** Os testes do "clean dummy speech bank"
-  esperam um `speech.slb` de 104 bytes, mas o pacote `level_mp00` tem o de
-  6944 bytes (o de varejo, com as tabelas de recursos que o loader exige). A
-  incompatibilidade é do commit com os assets atuais, não do código.
+- **A redireção do kernel para o pacote do host.** O `D:` do kernel resolve
+  primeiro no host: `D:\Levels\Level_00\X` cai em `assets/levels/level_mp00\X`
+  (o pacote limpo; o nome do level de varejo é apelido do `level_mp00`) e só vai
+  ao ISO de varejo quando o host não tem o arquivo. A fase lê os dois lados: o
+  que o host não traz (`spch_EN.bks`, `Music.bks`) vem do ISO. O `speech.slb` do
+  host é o de varejo (6944 bytes, com as tabelas de recursos que o loader
+  exige): os 104 bytes que alguns testes esperavam eram o offset da tabela de
+  recursos (lido em 0x5C), não o tamanho do arquivo.

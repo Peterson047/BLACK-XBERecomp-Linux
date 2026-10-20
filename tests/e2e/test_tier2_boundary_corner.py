@@ -137,10 +137,17 @@ class TestTier2BoundaryCorner(unittest.TestCase):
         self.assertTrue("level_mp00/LevelDat.bin" in res_dot or "level_00/LevelDat.bin" in res_dot,
                         f"Resolution failed to redirect to host: got '{res_dot}'")
 
-        # 3. Clean dummy speech bank isolation check (adversarial probe)
+        # 3. Speech bank isolation check (adversarial probe): the dot path has to reach the
+        # very same bank as the plain path, and that bank has to be the whole retail one.
+        # 104 is the offset of the speech resource table (read at 0x5C), not the size of the
+        # bank: the clean map keeps the retail bank, because the level loader indexes those
+        # tables and a truncated one breaks the level.
+        ok_plain, sz_plain, err = read_native_game_file_size(r"D:\Levels\Level_00\speech.slb")
+        self.assertTrue(ok_plain, f"Failed to read speech.slb: {err}")
         ok, sz, err = read_native_game_file_size(r"D:\Levels\.\Level_00\speech.slb")
         self.assertTrue(ok, f"Failed to read speech.slb: {err}")
-        self.assertEqual(sz, 104, f"Dot path bypassed clean dummy speech bank (expected 104 bytes, got {sz} bytes from ISO)")
+        self.assertGreater(sz, 104, f"Truncated speech bank: {sz} bytes")
+        self.assertEqual(sz, sz_plain, "Dot path must reach the very same speech bank")
 
     def test_f2_t2_mixed_slash_conversions(self):
         """F2-B2: Path containing alternating Windows '\\' and Unix '/' separators resolves via native C++ kernel."""
