@@ -168,7 +168,30 @@ void CoopSession::SetLoaded(bool loaded) {
 void CoopSession::SetReady(bool ready) {
     if (!enabled_) return;
     ready_ = ready;
-    if (IsGuest()) SendReady();
+    if (IsGuest()) {
+        SendReady();
+        return;
+    }
+    if (IsHost()) {
+        // The host is ready when it is: its own bit counts, the same way the
+        // bit of the loaded level does.
+        const uint8_t bit = 1;
+        if (ready) {
+            ready_mask_ |= bit;
+        } else {
+            ready_mask_ &= static_cast<uint8_t>(~bit);
+        }
+        PublishRoom();
+    }
+}
+
+// The mission is over: the round ends on both sides.
+void CoopSession::EndRound() {
+    if (!enabled_ || !IsHost()) return;
+    if (phase_ == coop::Phase::Ended) return;
+    phase_ = coop::Phase::Ended;
+    PublishRoom();
+    LOGI("coop: round epoch=%u ended", start_epoch_);
 }
 
 void CoopSession::TryStartRound() {
@@ -404,6 +427,12 @@ void CoopSession::OnCoopEvent(const uint8_t* data, size_t size) {
     ApplyEvent(event);
     DrainPending();
 
+    // The mission is over: the round ends on the guest too.
+    if (event.state.event_type == static_cast<uint8_t>(coop::EventType::MissionEnded)) {
+        phase_ = coop::Phase::Ended;
+        LOGI("coop: round epoch=%u ended", start_epoch_);
+    }
+
     // Tell the host how far we got, so it can stop sending.
     SendAck();
 }
@@ -443,16 +472,6 @@ void CoopSession::OnCoopAck(uint8_t player_id, const uint8_t* data, size_t size)
     unacked_.erase(std::remove_if(unacked_.begin(), unacked_.end(),
                                   [ack](const PendingEvent& pending) { return pending.seq <= ack.event_seq; }),
                    unacked_.end());
-}
-
-std::string CoopSession::Summary() const {
-    char buffer[256];
-    const uint32_t snapshots = IsHost() ? sent_snapshots_ : received_snapshots_;
-    std::snprintf(buffer, sizeof(buffer),
-                  "coop: summary epoch=%u snapshots=%u events=%u acked=%u unpaired=0 divergent=%u",
-                  start_epoch_, snapshots, IsHost() ? sent_events_ : applied_events_, last_applied_seq_,
-                  divergence_count_);
-    return buffer;
 }
 
 }  // namespace net

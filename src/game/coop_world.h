@@ -116,7 +116,6 @@ public:
     // The round. Everything that crosses the network carries it, and a
     // packet of an older round is dropped.
     void SetEpoch(uint32_t epoch);
-    uint32_t GetEpoch() const { return epoch_; }
     // A new round: the counters start again.
     void ResetRound(uint32_t epoch);
 
@@ -189,7 +188,6 @@ public:
     };
 
     // What the world layer counted during the round.
-    const WorldCounters& Counters() const { return counters_; }
     uint32_t UnpairedCount() const { return counters_.unpaired; }
     uint32_t DivergentCount() const { return counters_.divergent; }
 

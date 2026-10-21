@@ -74,12 +74,13 @@ public:
     void HostStartMission(uint8_t mission_id);
     // The guest says it finished loading the level.
     void SetLoaded(bool loaded);
+    // The peer is ready: the level is loaded and the round can begin.
     void SetReady(bool ready);
+    // The host: the mission is over and the round ends.
+    void EndRound();
 
     coop::Phase GetPhase() const { return phase_; }
     uint32_t GetStartEpoch() const { return start_epoch_; }
-    uint32_t GetSessionId() const { return session_id_; }
-    uint8_t GetMissionId() const { return mission_id_; }
     // The room as the guest last saw it.
     const coop::Room& GetRoom() const { return room_; }
 
@@ -104,9 +105,6 @@ public:
     // again, so a lost acknowledgement does not become a resend that never
     // ends.
     uint32_t GetAckCount() const { return acks_sent_; }
-
-    // The summary the log gate reads.
-    std::string Summary() const;
 
     // The transport calls these.
     void OnCoopRoom(const uint8_t* data, size_t size) override;

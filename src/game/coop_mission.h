@@ -213,8 +213,12 @@ public:
         return divergent_;
     }
 
-    // True while the guest is firing an event of the host in its own bus.
-    bool IsReplaying() const { return replaying_; }
+    // The mission is over: every objective of the table is done, or the host
+    // said so. The round ends on both sides.
+    bool Ended() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return ended_;
+    }
 
     // The summary of the session, at the end of it.
     void LogSummary() const;

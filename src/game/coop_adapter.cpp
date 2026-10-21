@@ -134,6 +134,9 @@ void Adapter::Tick(float dt) {
     // The level finished loading: the barrier can close.
     if (!level_loaded_ && LevelLoaded()) {
         level_loaded_ = true;
+        // The peer is ready when the level is loaded: that is what the
+        // barrier waits for.
+        session_.SetReady(true);
         session_.SetLoaded(true);
         LOGI("coop: level loaded");
     }
@@ -155,6 +158,8 @@ void Adapter::Tick(float dt) {
         // The events the level script fired.
         net::coop::Event event;
         while (Mission::Get().NextEvent(&event)) session_.PublishEvent(event);
+        // The mission is over: the round ends on both sides.
+        if (Mission::Get().Ended()) session_.EndRound();
     }
 
     // The test harness's kill, once there is an actor to kill. The level

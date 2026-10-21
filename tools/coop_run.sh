@@ -44,12 +44,30 @@ echo "run dir: $RUN_DIR  duration: ${DURATION}s  port: $PORT"
 
 # The window is the only thing that needs a display; the game itself is happy
 # on a virtual one. Two Xvfb servers keep the instances apart.
+#
+# The displays are not fixed: Xvfb picks a free one and writes its number to
+# the file descriptor. A fixed display is shared by two runs that happen at
+# the same time, and when one of them ends it takes the X server of the other
+# with it: the instance loses its window and dies.
 start_instance() {
     local name="$1"; shift
-    local display="$1"; shift
-    Xvfb "$display" -screen 0 1280x720x24 >/dev/null 2>&1 &
+    local display_file="$RUN_DIR/display.$name"
+    Xvfb -displayfd 3 -screen 0 1280x720x24 >/dev/null 2>&1 3>"$display_file" &
     local xvfb_pid=$!
-    sleep 1
+    local display=""
+    for _ in $(seq 1 50); do
+        local number
+        number="$(cat "$display_file" 2>/dev/null)"
+        if [[ -n "$number" ]]; then
+            display=":$number"
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ -z "$display" ]]; then
+        echo "no display for $name" >&2
+        return 1
+    fi
     # The game relaunches itself, so the instance gets its own group and the
     # whole group has to go when the run ends.
     setsid env DISPLAY="$display" "$BIN" "$@" >"$RUN_DIR/$name.out" 2>&1 &
@@ -57,9 +75,9 @@ start_instance() {
     echo "$xvfb_pid $game_pid"
 }
 
-read -r HOST_XVFB HOST_PID <<<"$(start_instance host ":77" --coop --host "$PORT" --name "$HOST_NAME")"
+read -r HOST_XVFB HOST_PID <<<"$(start_instance host --coop --host "$PORT" --name "$HOST_NAME")"
 sleep 2
-read -r GUEST_XVFB GUEST_PID <<<"$(start_instance guest ":78" --coop --connect "127.0.0.1:$PORT" --name "$GUEST_NAME")"
+read -r GUEST_XVFB GUEST_PID <<<"$(start_instance guest --coop --connect "127.0.0.1:$PORT" --name "$GUEST_NAME")"
 
 sleep "$DURATION"
 
