@@ -5,6 +5,12 @@ A especificação é `docs/COOP.md`; os offsets verificados são
 `.agents/teamwork/coop/LAYOUT.md`; o contrato da rede é
 `.agents/teamwork/coop/PROTOCOL.md`.
 
+# O que a co-op faz, e o que falta
+
+> A especificação é `docs/COOP.md`. Ela tem **seis afirmações erradas** sobre
+> o motor, corrigidas aqui e em `LAYOUT.md` — leia estes dois antes de seguir
+> a spec.
+
 ## 1. O que funciona
 
 | peça | como se sabe |
@@ -241,6 +247,44 @@ motor (`0x0017E420`) lendo `+0x14` do **descriptor** do ator
 corpo do parceiro, e ele diz o que falta: **o corpo precisa de uma unidade do
 level de verdade**.
 
+## 6c. A revisão
+
+Um agente leu o código do co-op commitado e procurou o que estava errado.
+Onze achados, e a maioria era séria:
+
+- `StartRound` limpava a lista de eventos não-confirmados e zerava o
+  contador de sequência **sem o lock**, enquanto a thread do motor publica
+  sob ele — a mesma corrupção de heap que já tinha sido paga uma vez, e
+  ainda podia rolar a sequência para trás e fazer o convidado descartar um
+  evento para sempre;
+- o dano que ficava esperando o ator era reenfileirado **no fim**, e o
+  convidado aplicava os eventos fora de ordem — e a cadeia de morte do
+  motor não é segura fora de ordem;
+- o casamento do "gêmeo" na camada de missão olhava só a **cabeça** da fila:
+  um evento local sem par envenenava a fila para sempre, o convidado
+  contava cada objetivo **duas vezes** e terminava a fase sozinho;
+- o hash do nome cobria `length-1` bytes; o motor hasha o nome inteiro;
+- o contador de divergência contava um buraco que o reenvio fechava, e o
+  gate reprovava a rodada por isso;
+- o *fallback* do dano casava atores pelo **ponto de impacto**, que não é
+  onde o ator está;
+- a barreira de carga dependia de **um único datagrama**: perdido, o par
+  ficava no lobby para sempre, e o timeout não salvava, porque o convidado
+  continuava dando ping;
+- um snapshot que não cabia era enviado **truncado**, e os atores que
+  faltavam ficavam faltando para sempre.
+
+E uma correção de fundo: **a memória do motor é lida na thread do motor e
+copiada** — a thread que desenha trabalha sobre a cópia.
+
+O que a revisão confirmou como certo: **todos os offsets** do motor
+(reverificados um a um no código recompilado), e as invariantes do
+protocolo — o convidado nunca é fonte, o lock nunca é segurado durante um
+envio, um evento repetido é aplicado uma vez e reconfirmado, a camada de
+mundo nunca escreve num ator morto ou reciclado, e as guardas de
+`Current()` impedem que a memória do motor seja tocada na thread de
+desenho.
+
 ## 7. O que está Explicitamente fora de escopo ainda
 
 - **O corpo do parceiro** (camada 3): o corpo **existe e anima** — ele
@@ -253,5 +297,11 @@ level de verdade**.
   matcher de objetivos nunca o casa.
 - **A vida do jogador**: hoje é local em cada processo, com o PvP desligado.
   É uma decisão, não um acidente, e está escrita em `MODE.md`.
+- **A reconexão**: se um par cai no meio da fase, a sessão acaba. É o
+  comportamento natural e ainda não foi decidido o outro.
+- **O tempo**: o convidado continua nascendo uns dois segundos depois do
+  host, porque o script do level do convidado reage a onde o jogador **dele**
+  está. A replicação da ativação alinha a **identidade** (qual ator é qual),
+  não o **quando**.
 - **A reconexão**: se um par cai no meio da fase, a sessão acaba. É o
   comportamento natural e ainda não foi decidido o outro.
