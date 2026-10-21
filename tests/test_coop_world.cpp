@@ -179,6 +179,69 @@ void TestEventOrder() {
     CHECK(order.Accept(3, 5) == EventOrderResult::kStaleEpoch);
 }
 
+// The activation of an actor.
+//
+// The descriptor of an activation is a unit of the level: a place in the
+// manager's table of units. The two processes load the same level, so the
+// place is the same in the two, and the place travels instead of the
+// address, which is only true inside one process.
+void TestActivationDescriptor() {
+    // a place in the table of the units
+    CHECK(game::coop::IsUnitDescriptor(static_cast<int32_t>(0x7A20)));
+    CHECK(game::coop::IsUnitDescriptor(static_cast<int32_t>(0x7A20 + 35 * 0x40)));
+    // the last place of the table is inside the block of the manager
+    CHECK(game::coop::IsUnitDescriptor(static_cast<int32_t>(0x7A20 + 44 * 0x40)));
+    CHECK(!game::coop::IsUnitDescriptor(static_cast<int32_t>(0x7A20 + 45 * 0x40)));
+    // and out of it is not
+    CHECK(!game::coop::IsUnitDescriptor(-1));
+    CHECK(!game::coop::IsUnitDescriptor(0));
+    CHECK(!game::coop::IsUnitDescriptor(static_cast<int32_t>(0x7A21)));
+    CHECK(!game::coop::IsUnitDescriptor(static_cast<int32_t>(0x8540)));
+    CHECK(!game::coop::IsUnitDescriptor(static_cast<int32_t>(0x7A20 + 0x40 - 4)));
+}
+
+// The decision the guest makes with an activation, and the generation its
+// own actors take.
+void TestActivationLedger() {
+    net::coop::EventState state{};
+    state.native_a = 0x11112222;
+    state.native_b = 0x33334444;
+    state.activation.descriptor_offset = 0x7A20;
+
+    game::coop::ActivationLedger ledger;
+
+    // The guest does not have the actor: the guest's own level script will
+    // activate the object, and the generation of the host waits for it.
+    CHECK(game::coop::DecideActivation(state, ledger, false) == game::coop::ActivationAction::kWait);
+    ledger.generations.push_back(4);
+
+    // The guest's script activates the object: it takes the generation of
+    // the host that goes with it.
+    uint32_t generation = 0;
+    CHECK(game::coop::TakeGeneration(&ledger, &generation));
+    CHECK(generation == 4);
+    CHECK(ledger.generations.empty());
+
+    // The host brings the object back: the second activation of the host
+    // waits for the second activation of the guest.
+    CHECK(game::coop::DecideActivation(state, ledger, false) == game::coop::ActivationAction::kWait);
+    ledger.generations.push_back(6);
+    CHECK(game::coop::TakeGeneration(&ledger, &generation));
+    CHECK(generation == 6);
+
+    // The guest's script was ahead of the host: it activated the object
+    // before the host's word came, and the actor takes the host's
+    // generation when the word comes.
+    CHECK(game::coop::TakeGeneration(&ledger, &generation) == false);
+    CHECK(ledger.own == 1);
+    CHECK(game::coop::DecideActivation(state, ledger, true) == game::coop::ActivationAction::kAdopt);
+
+    // A descriptor the guest cannot have is refused, whatever else is true.
+    state.activation.descriptor_offset = 0x1234;
+    CHECK(game::coop::DecideActivation(state, ledger, true) == game::coop::ActivationAction::kReject);
+    CHECK(game::coop::DecideActivation(state, ledger, false) == game::coop::ActivationAction::kReject);
+}
+
 // The log vocabulary: "coop: <verb> key=value key=value ...". A strict
 // regular expression has to be able to read it.
 void TestLogVocabulary() {
@@ -212,6 +275,8 @@ int main() {
     TestIdentityComparison();
     TestPairing();
     TestEventOrder();
+    TestActivationDescriptor();
+    TestActivationLedger();
     TestLogVocabulary();
     puts("coop world test passed");
     return 0;

@@ -185,6 +185,19 @@ void TestEventRoundTrip() {
     event.state.event_id = 77;
     std::memcpy(event.state.text[0], "door", 5);
     std::memcpy(event.state.text[1], "museum", 7);
+    // The activation of an actor: the place of the descriptor in the table
+    // of the units, the value the routine takes in the register, the rest of
+    // the arguments and the transform of the spawn.
+    event.state.activation.descriptor_offset = 0x7A20 + 35 * 0x40;
+    event.state.activation.third = 1;
+    event.state.activation.arg6 = 0x97C60000u;
+    event.state.activation.arg7 = 0x54461272u;
+    event.state.activation.arg8 = 2;
+    event.state.activation.arg9 = 1;
+    event.state.activation.transform[0] = -79.5f;
+    event.state.activation.transform[1] = 0.25f;
+    event.state.activation.transform[2] = 15.1f;
+    event.state.activation.transform[3] = 3.0f;
 
     std::vector<uint8_t> buffer(sizeof(EventState) + 64, 0);
     const size_t written = EncodeEvent(event, buffer.data(), buffer.size());
@@ -206,6 +219,29 @@ void TestEventRoundTrip() {
     CHECK(decoded.state.event_id == 77);
     CHECK(std::string(decoded.state.text[0]) == "door");
     CHECK(std::string(decoded.state.text[1]) == "museum");
+    // The activation travels whole.
+    CHECK(decoded.state.activation.descriptor_offset == 0x7A20 + 35 * 0x40);
+    CHECK(decoded.state.activation.third == 1);
+    CHECK(decoded.state.activation.arg6 == 0x97C60000u);
+    CHECK(decoded.state.activation.arg7 == 0x54461272u);
+    CHECK(decoded.state.activation.arg8 == 2);
+    CHECK(decoded.state.activation.arg9 == 1);
+    CHECK(decoded.state.activation.transform[0] == -79.5f);
+    CHECK(decoded.state.activation.transform[3] == 3.0f);
+}
+
+// The event of an activation has to stay inside the path a NAT keeps: the
+// datagram is the payload plus the header of the packet.
+void TestEventFitsTheDatagram() {
+    Event event{};
+    event.state.event_type = static_cast<uint8_t>(EventType::ActorActivated);
+    event.state.activation.descriptor_offset = 0x7A20;
+    std::vector<uint8_t> buffer(sizeof(EventState) + 64, 0);
+    const size_t written = EncodeEvent(event, buffer.data(), buffer.size());
+    CHECK(written == sizeof(EventState));
+    CHECK(written + sizeof(PacketHeader) < 1200);
+    // A short buffer is refused instead of written past.
+    CHECK(EncodeEvent(event, buffer.data(), sizeof(EventState) - 1) == 0);
 }
 
 void TestReadyAndAck() {
@@ -250,6 +286,7 @@ int main() {
     TestSnapshotRefusesBadCounts();
     TestFullSnapshotFitsTheDatagram();
     TestEventRoundTrip();
+    TestEventFitsTheDatagram();
     TestReadyAndAck();
     TestMessageTypesAreDistinct();
     puts("coop protocol test passed");

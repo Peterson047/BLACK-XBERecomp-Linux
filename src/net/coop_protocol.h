@@ -46,6 +46,11 @@ enum class EventType : uint8_t {
     MissionEnded = 5,
     NamedEvent = 6,  // one of the level script's own named events
     Destruction = 7,
+    // The host activated an actor. The two copies of the level do not
+    // activate the same objects at the same time - the level script reacts
+    // to where the player is, and the two players are in different places -
+    // so the guest has to be told, or the two worlds are not the same world.
+    ActorActivated = 8,
 };
 
 enum ActorFlags : uint16_t {
@@ -56,6 +61,31 @@ enum ActorFlags : uint16_t {
 };
 
 #pragma pack(push, 1)
+
+// What the guest needs to reproduce an activation of the host.
+//
+// The activation is the engine's own 0x001DA4F0(actor, descriptor, third,
+// ...): the actor is the one the engine gives, the descriptor is the unit of
+// the level the actor comes from, and the third is the value the routine
+// takes in a register.
+//
+// The descriptor is not an address that travels: the two processes run the
+// same level and the manager's table of units is in the same place in the
+// two, so what travels is the place in that table. The transform is not an
+// address either - it lives in the stack of the caller - so what travels is
+// its content: the position of the spawn and the angle of it.
+//
+// The identity (the pair and the generation) and the type are already in the
+// event, and the activation writes them itself, so they do not travel twice.
+struct ActivationState {
+    int32_t descriptor_offset;  // the descriptor's place in the manager's table of units
+    uint32_t third;              // the value the activation takes in the register
+    uint32_t arg6;               // the sixth argument of the activation
+    uint32_t arg7;
+    uint32_t arg8;
+    uint32_t arg9;
+    float transform[4];          // the spawn: x, y, z and the angle
+};
 
 // One actor of the world, as the host sees it.
 //
@@ -136,6 +166,9 @@ struct EventState {
     uint32_t extra;       // who caused it, or a counter
     uint32_t event_id;    // the named event's id
     char text[2][96];     // the named event's two strings
+    // What an activation needs, when the event is one. It is at the end so
+    // the places of the fields above do not move.
+    ActivationState activation;
 };
 
 struct ReadyState {

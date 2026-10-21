@@ -49,7 +49,19 @@ constexpr uint32_t kActorAlive = 0;
 constexpr uint32_t kActorRecycled = 1;
 constexpr uint32_t kActorDead = 2;
 
+// How many frames a damage waits for the actor it is about. The two copies
+// of the level activate the objects of the level at their own pace, so the
+// guest's actor can be a few frames behind the host's.
+constexpr uint32_t kMaxActorWaits = 240;
+
 }  // namespace
+
+// The numbers in the pure header are the mirror of the ones in layout.h, so
+// the pure decisions can be tested without the game. The world layer checks
+// that they are the same when it is built.
+static_assert(layout::coop::kActorUnitTable == game::coop::kUnitTableOffset, "the unit table moved");
+static_assert(layout::coop::kActorUnitStride == game::coop::kUnitStride, "the stride of a unit moved");
+static_assert(layout::coop::kActorManagerSize == game::coop::kManagerSize, "the size of the manager moved");
 
 namespace game {
 namespace coop {
@@ -223,18 +235,30 @@ bool World::ApplySnapshot(const net::coop::Snapshot& snapshot) {
     Pairing pairing = PairActors(identities, snapshot);
     // The counter is the state of this frame, not a running total: the gate
     // reads it to know whether the two sides agree right now.
-    counters_.unpaired = pairing.unpaired;
+    //
+    // An actor the host published an activation for is not unpaired, even
+    // when the snapshot that carries it has not arrived yet: the host said
+    // it has that actor, and the word of the activation cannot be late.
+    uint32_t unpaired = pairing.unpaired;
+    if (unpaired > 0) {
+        for (size_t i = 0; i < identities.size(); i++) {
+            if (pairing.guest_to_snapshot[i] >= 0) continue;
+            if (!HostPublished(identities[i].native_a, identities[i].native_b)) continue;
+            unpaired--;
+        }
+    }
+    counters_.unpaired = unpaired;
     counters_.snapshots++;
     LOGI("%s", FormatLog("pair", {{"epoch", std::to_string(epoch_)},
                                    {"paired", std::to_string(pairing.paired)},
-                                   {"unpaired", std::to_string(pairing.unpaired)},
+                                   {"unpaired", std::to_string(unpaired)},
                                    {"missing", std::to_string(pairing.missing)}})
                        .c_str());
     // The two lines say when the pairing changed, not every frame: a log
     // that says the same thing a hundred times hides the one time it
     // changes, and the gate reads this log.
-    if (pairing.unpaired != last_unpaired_) {
-        last_unpaired_ = pairing.unpaired;
+    if (unpaired != last_unpaired_) {
+        last_unpaired_ = unpaired;
         LOGI("%s", FormatLog("unpaired", {{"side", "guest"},
                                           {"count", std::to_string(pairing.unpaired)},
                                           {"epoch", std::to_string(epoch_)}})
@@ -314,7 +338,7 @@ void World::WriteActorState(uint32_t actor, const net::coop::ActorState& state) 
 // The guest: the host's damage, through the engine's own damage routine. The
 // routine runs the whole death chain, so the guest's mission script advances
 // the way the host's does.
-bool World::ReplayDamage(const net::coop::Event& event) {
+ReplayResult World::ReplayDamage(const net::coop::Event& event, uint32_t waits) {
     const net::coop::EventState& state = event.state;
 
     // the actor the event is about
@@ -363,11 +387,15 @@ bool World::ReplayDamage(const net::coop::Event& event) {
         }
     }
     if (!actor) {
-        // the guest does not have the actor the event is about: it is either
-        // already gone, which the death chain explains, or it never was
-        // there, which is a divergence
-        counters_.skipped++;
-        {
+        // The guest does not have the actor the event is about: it is either
+        // already gone, which the death chain explains, or it is not there
+        // yet, which the level script of the guest will fix.
+        //
+        // The line is written once, when the wait starts: the event is
+        // tried again in every frame, and a log that says the same thing
+        // every frame hides the one thing that matters.
+        if (waits == 0) {
+            counters_.skipped++;
             std::string keys;
             for (uint32_t candidate : actors) {
                 keys += " " + std::to_string(R32(candidate + layout::coop::kActorKeyA)) + "/" +
@@ -385,12 +413,10 @@ bool World::ReplayDamage(const net::coop::Event& event) {
                                                        {"have", keys}})
                                .c_str());
         }
-        LOGI("%s", FormatLog("apply", {{"kind", "damage"},
-                                       {"reason", "no_actor"},
-                                       {"epoch", std::to_string(state.start_epoch)},
-                                       {"seq", std::to_string(state.event_seq)}})
-                           .c_str());
-        return false;
+        // The actor may still come: the two copies of the level activate the
+        // objects of the level at their own pace, so the guest's actor can
+        // be a frame or two behind the host's.
+        return ReplayResult::kNoActor;
     }
 
     // a dead actor takes no more damage, and the routine is not safe to run
@@ -403,7 +429,7 @@ bool World::ReplayDamage(const net::coop::Event& event) {
                                        {"actor", std::to_string(actor)},
                                        {"state", std::to_string(actor_state)}})
                            .c_str());
-        return false;
+        return ReplayResult::kSkipped;
     }
 
     // the guest's memory for what the routine reads: the direction and the
@@ -471,7 +497,216 @@ bool World::ReplayDamage(const net::coop::Event& event) {
                                    {"state", std::to_string(R32(actor + layout::coop::kActorState))},
                                    {"seq", std::to_string(state.event_seq)}})
                        .c_str());
+    return ReplayResult::kApplied;
+}
+
+// The guest: the living actor with this identity, or zero.
+//
+// The pair at actor+0x08 / actor+0x0C is the engine's own key for the script
+// object, so two actors with the same pair are the same object of the level.
+uint32_t World::FindLiveActor(uint32_t key_a, uint32_t key_b) const {
+    if (key_a == 0 && key_b == 0) return 0;  // the player of this process
+    std::vector<uint32_t> actors;
+    EnumerateActors(&actors);
+    for (uint32_t actor : actors) {
+        if (R32(actor + layout::coop::kActorKeyA) != key_a) continue;
+        if (R32(actor + layout::coop::kActorKeyB) != key_b) continue;
+        return actor;
+    }
+    return 0;
+}
+
+// The host: the engine activated an actor, and the guest has to activate its
+// own copy of it.
+//
+// The event carries what the activation needs and what does not travel: the
+// identity and the type are already in the event, the descriptor travels as
+// its place in the manager's table of units, and the transform of the spawn
+// travels as its content, because it lives in the stack of the caller.
+void World::PublishActivation(const ActivationCall& call) {
+    if (!IsHost() || !call.actor) return;
+    // The player of this process is not an object of the level: each side
+    // has its own, and the engine gives it no identity.
+    if (call.key_a == 0 && call.key_b == 0) return;
+    const uint32_t manager = R32(layout::coop::kActorManager);
+    if (!manager) return;
+    const int32_t offset = static_cast<int32_t>(call.descriptor - manager);
+    if (!IsUnitDescriptor(offset)) {
+        // The descriptor is not a unit of the level: the guest would have no
+        // way of finding its own copy, so the activation is not published.
+        // It has to be visible: a silent divergence is the worst outcome.
+        counters_.divergent++;
+        LOGI("%s", FormatLog("divergence", {{"reason", "descriptor"},
+                                             {"epoch", std::to_string(epoch_)},
+                                             {"descriptor", std::to_string(call.descriptor)},
+                                             {"manager", std::to_string(manager)}})
+                           .c_str());
+        return;
+    }
+    net::coop::Event event;
+    event.state.start_epoch = epoch_;
+    event.state.event_type = static_cast<uint8_t>(net::coop::EventType::ActorActivated);
+    event.state.native_a = call.key_a;
+    event.state.native_b = call.key_b;
+    event.state.generation = R32(call.actor + layout::coop::kActorGeneration);
+    event.state.object_type = static_cast<uint16_t>(R32(call.actor + layout::coop::kActorType));
+    for (int i = 0; i < 3; i++) {
+        event.state.pos[i] = G<float>(call.actor + layout::coop::kActorPosition + i * 4);
+    }
+    event.state.activation.descriptor_offset = offset;
+    event.state.activation.third = call.third;
+    event.state.activation.arg6 = call.arg6;
+    event.state.activation.arg7 = call.arg7;
+    event.state.activation.arg8 = call.arg8;
+    event.state.activation.arg9 = call.arg9;
+    for (int i = 0; i < 4; i++) event.state.activation.transform[i] = call.transform[i];
+    counters_.events++;
+    LOGI("%s", FormatLog("activate", {{"side", "host"},
+                                       {"actor", std::to_string(call.actor)},
+                                       {"key_a", std::to_string(call.key_a)},
+                                       {"key_b", std::to_string(call.key_b)},
+                                       {"generation", std::to_string(event.state.generation)},
+                                       {"type", std::to_string(event.state.object_type)},
+                                       {"unit", std::to_string(offset)}})
+                           .c_str());
+    // The event goes out now, from the engine's thread, so it keeps the
+    // place of the activation in the order of the events. The damage of the
+    // actor that was just activated has to come after it.
+    if (publisher_) {
+        publisher_(event);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    outgoing_events_.push_back(event);
+}
+
+// The guest: did the host say it has an actor of this object of the level?
+bool World::HostPublished(uint32_t key_a, uint32_t key_b) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& published : host_published_) {
+        if (published.first == key_a && published.second == key_b) return true;
+    }
+    return false;
+}
+
+void World::NoteHostPublished(uint32_t key_a, uint32_t key_b) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& published : host_published_) {
+        if (published.first == key_a && published.second == key_b) return;
+    }
+    host_published_.emplace_back(key_a, key_b);
+}
+
+// The guest: what the host published about this object of the level.
+World::HostActivation* World::FindHostActivation(uint32_t key_a, uint32_t key_b) {
+    for (HostActivation& known : host_activations_) {
+        if (known.key_a == key_a && known.key_b == key_b) return &known;
+    }
+    return nullptr;
+}
+
+// The guest: the host activated an actor, and the guest has to have it too.
+//
+// The guest's own level script runs the whole level, so it activates the
+// objects of the level on its own - but it does not do it at the same time as
+// the host, because the level script reacts to where the player is and the
+// two players are in different places.
+//
+// The word of the host is what tells the guest which generation the object
+// of the level has. The guest's engine gives the actor the generation of its
+// own counter, and the two counters do not count in the same order, so the
+// guest takes the host's number: the host is the authority of the world,
+// and the two sides have to agree on which actor is which.
+bool World::ApplyActivation(const net::coop::Event& event) {
+    if (!IsGuest()) return false;
+    const net::coop::EventState& state = event.state;
+    const net::coop::ActivationState& activation = state.activation;
+
+    // The host has an actor of this object of the level: the guest knows it
+    // now, whatever the snapshot says.
+    NoteHostPublished(state.native_a, state.native_b);
+    HostActivation* known = FindHostActivation(state.native_a, state.native_b);
+    if (!known) {
+        known = &host_activations_.emplace_back();
+        known->key_a = state.native_a;
+        known->key_b = state.native_b;
+    }
+    // The guest's own level script was ahead of the host: it activated the
+    // object before the host's word came, and its actor takes the host's
+    // generation now, so the two sides agree on which actor is which.
+    const uint32_t existing = FindLiveActor(state.native_a, state.native_b);
+    const ActivationAction action = DecideActivation(state, known->ledger, existing != 0);
+    if (action == ActivationAction::kReject) {
+        // The descriptor is not a unit of the level: the guest has no way of
+        // finding its own copy of it.
+        counters_.skipped++;
+        LOGI("%s", FormatLog("apply", {{"kind", "activation"},
+                                       {"reason", "descriptor"},
+                                       {"epoch", std::to_string(state.start_epoch)},
+                                       {"unit", std::to_string(activation.descriptor_offset)}})
+                           .c_str());
+        return false;
+    }
+    if (action == ActivationAction::kAdopt) {
+        known->ledger.own--;
+        W32(existing + layout::coop::kActorGeneration, state.generation);
+        counters_.adopted++;
+        LOGI("%s", FormatLog("apply", {{"kind", "activation"},
+                                       {"reason", "adopted"},
+                                       {"actor", std::to_string(existing)},
+                                       {"key_a", std::to_string(state.native_a)},
+                                       {"key_b", std::to_string(state.native_b)},
+                                       {"generation", std::to_string(state.generation)}})
+                           .c_str());
+        return true;
+    }
+    // The guest does not have the actor yet: its own level script will
+    // activate it. The host's generation is kept, and the actor the guest's
+    // script makes takes it.
+    known->ledger.generations.push_back(state.generation);
+    LOGI("%s", FormatLog("apply", {{"kind", "activation"},
+                                   {"reason", "waiting"},
+                                   {"key_a", std::to_string(state.native_a)},
+                                   {"key_b", std::to_string(state.native_b)},
+                                   {"generation", std::to_string(state.generation)},
+                                   {"unit", std::to_string(activation.descriptor_offset)}})
+                       .c_str());
     return true;
+}
+
+// The guest: the engine's own level script activated an actor.
+//
+// The guest's script activates the objects of the level on its own. When it
+// activates one the host has already activated, the two copies would have
+// two actors of the same object of the level, and the engine matches objects
+// with the pair of the identity, so the two would fight over the same key.
+//
+// The engine's own actor wins: it is the one the script knows about. It
+// takes the generation the host gave, so the two sides still agree on which
+// actor is which.
+void World::AfterGuestActivation(uint32_t actor, uint32_t key_a, uint32_t key_b) {
+    if (!IsGuest() || !actor) return;
+    if (key_a == 0 && key_b == 0) return;  // the player of this process
+    HostActivation* known = FindHostActivation(key_a, key_b);
+    if (!known) return;
+    // The generation of the host that goes with this actor: the queue is in
+    // the order the host made them, and the guest's script activates the
+    // objects in the same order.
+    uint32_t generation = 0;
+    if (!TakeGeneration(&known->ledger, &generation)) {
+        // The host has not activated this object yet: the guest's actor
+        // keeps the generation of the guest's own counter.
+        return;
+    }
+    W32(actor + layout::coop::kActorGeneration, generation);
+    counters_.adopted++;
+    LOGI("%s", FormatLog("apply", {{"kind", "activation"},
+                                   {"reason", "took"},
+                                   {"actor", std::to_string(actor)},
+                                   {"key_a", std::to_string(key_a)},
+                                   {"key_b", std::to_string(key_b)},
+                                   {"generation", std::to_string(generation)}})
+                       .c_str());
 }
 
 bool World::ApplyEvent(const net::coop::Event& event) {
@@ -495,17 +730,25 @@ bool World::ApplyEvent(const net::coop::Event& event) {
     }
     // the event counts on both sides, so the two summaries agree
     counters_.events++;
+    if (state.event_type == static_cast<uint8_t>(net::coop::EventType::ActorActivated)) {
+        // The activation of an actor: it is the engine's memory, so it waits
+        // for the engine's thread.
+        if (Current()) return ApplyActivation(event);
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_events_.push_back(PendingEvent{event, 0});
+        return true;
+    }
     if (state.event_type != static_cast<uint8_t>(net::coop::EventType::ActorDamaged)) {
         // the other kinds of event are the session's business
         return false;
     }
     if (Current()) {
         // the engine runs on a guest thread, and the routine is the engine's
-        return ReplayDamage(event);
+        return ReplayDamage(event, 0) == ReplayResult::kApplied;
     }
     // not on a guest thread: the event waits for the next frame of the guest
     std::lock_guard<std::mutex> lock(mutex_);
-    pending_events_.push_back(event);
+    pending_events_.push_back(PendingEvent{event, 0});
     return true;
 }
 
@@ -550,13 +793,39 @@ void World::AfterActorTick(uint32_t actor) {
 
     if (!IsGuest()) return;
 
-    // the events that arrived outside the guest thread
-    std::vector<net::coop::Event> events;
-    {
+    // The events that arrived outside the guest thread.
+    //
+    // The tick of the actor runs once per actor, and the events are applied
+    // once per frame: a damage that waits for its actor is tried again in
+    // the next frame, not in the next actor.
+    std::vector<PendingEvent> events;
+    const uint32_t frame = R32(layout::coop::kFrameCount);
+    if (frame != last_event_frame_) {
+        last_event_frame_ = frame;
         std::lock_guard<std::mutex> lock(mutex_);
         events.swap(pending_events_);
     }
-    for (const net::coop::Event& event : events) ReplayDamage(event);
+    std::vector<PendingEvent> waiting;
+    for (PendingEvent& item : events) {
+        if (item.event.state.event_type == static_cast<uint8_t>(net::coop::EventType::ActorActivated)) {
+            // The activation comes before the damage of the actor it
+            // activated, or the guest would have no actor to damage.
+            ApplyActivation(item.event);
+            continue;
+        }
+        if (ReplayDamage(item.event, item.waits) == ReplayResult::kNoActor && item.waits < kMaxActorWaits) {
+            // The actor of the damage is not in the world yet: the guest's
+            // own level script activates the objects of the level at its own
+            // pace, so the actor comes a frame or two later. The damage
+            // waits for it.
+            item.waits++;
+            waiting.push_back(item);
+        }
+    }
+    if (!waiting.empty()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const PendingEvent& item : waiting) pending_events_.push_back(item);
+    }
 
     // the host's state of this actor
     net::coop::ActorState state;
@@ -788,4 +1057,45 @@ X86_FUNC(sub_001F08D0) {
     uint32_t actor = ctx.ecx;
     __imp__sub_001F08D0(ctx, base);
     game::coop::World::Get().AfterActorTick(actor);
+}
+
+// The engine's own activation, 0x001DA4F0.
+//
+// The host publishes the activation: the guest's level script does not
+// activate the same objects at the same time, so the guest has to be told.
+// The guest's own script activation is left alone - the engine's own actor
+// wins over the copy the host made, and the copy is dropped.
+X86_EXTERN_FUNC(__imp__sub_001DA4F0);
+X86_FUNC(sub_001DA4F0) {
+    game::coop::World& world = game::coop::World::Get();
+    // The arguments, before the call: the routine pops them, so they are
+    // gone after it.
+    const uint32_t actor = R32(ctx.esp + 4);
+    const uint32_t key_a = R32(ctx.esp + 0x10);
+    const uint32_t key_b = R32(ctx.esp + 0x14);
+    if (world.IsGuest()) {
+        __imp__sub_001DA4F0(ctx, base);
+        world.AfterGuestActivation(actor, key_a, key_b);
+        return;
+    }
+    if (world.IsHost()) {
+        game::coop::ActivationCall call;
+        call.actor = actor;
+        call.descriptor = R32(ctx.esp + 8);
+        call.third = ctx.eax;
+        call.key_a = key_a;
+        call.key_b = key_b;
+        call.arg6 = R32(ctx.esp + 0x18);
+        call.arg7 = R32(ctx.esp + 0x1C);
+        call.arg8 = R32(ctx.esp + 0x20);
+        call.arg9 = R32(ctx.esp + 0x24);
+        const uint32_t transform = R32(ctx.esp + 0xC);
+        for (int i = 0; i < 4; i++) {
+            call.transform[i] = transform ? G<float>(transform + i * 4) : 0.0f;
+        }
+        __imp__sub_001DA4F0(ctx, base);
+        world.PublishActivation(call);
+        return;
+    }
+    __imp__sub_001DA4F0(ctx, base);
 }

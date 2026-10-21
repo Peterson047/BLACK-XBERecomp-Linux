@@ -208,7 +208,82 @@ struct WorldCounters {
     uint32_t divergent = 0;  // the events that arrived out of order or stale
     uint32_t skipped = 0;    // the damages that were not applied
     uint32_t applied = 0;    // the damages that were replayed
+    uint32_t adopted = 0;    // the activations the guest took the host's generation of
 };
+
+// The activation of an actor.
+//
+// The descriptor of an activation is a unit of the level: a place in the
+// manager's table of units. The two processes load the same level, so the
+// table is in the same place in the two, and the place of the descriptor is
+// what travels - not the address, which is only true inside one process.
+//
+// The numbers here are the mirror of the ones in game/layout.h; the world
+// layer checks that they are the same when it is built.
+constexpr uint32_t kUnitTableOffset = 0x7A20;
+constexpr uint32_t kUnitStride = 0x40;
+constexpr uint32_t kManagerSize = 0x8540;
+
+// Is this offset a place in the manager's table of units?
+inline bool IsUnitDescriptor(int32_t offset) {
+    if (offset < 0) return false;
+    const uint32_t place = static_cast<uint32_t>(offset);
+    if (place < kUnitTableOffset) return false;
+    if (place >= kManagerSize) return false;
+    return (place - kUnitTableOffset) % kUnitStride == 0;
+}
+
+// What the guest does with an activation the host sent.
+enum class ActivationAction {
+    kAdopt,   // the guest has the actor and takes the host's generation
+    kWait,    // the guest's own level script will activate the object
+    kReject,  // the descriptor is not a place the guest can have
+};
+
+// The guest's own activations of one object of the level, and the ones the
+// host published.
+//
+// The host activates the same object of the level more than once - the level
+// script brings it back - so the generations of the host are a queue, in the
+// order the host made them. The guest's own level script activates the
+// object too, and each of its actors takes the generation of the host that
+// goes with it.
+struct ActivationLedger {
+    std::vector<uint32_t> generations;  // the host's, in order
+    uint32_t own = 0;  // the activations of the guest's own script with no
+                       // generation of the host to go with them
+};
+
+// The decision the guest makes with an activation.
+//
+// The guest is never a source: it activates what the host named, and only
+// that. When the guest's own script was ahead of the host - it activated the
+// object before the host's word came - the guest's actor takes the host's
+// generation, so the two sides agree on which actor is which. Otherwise the
+// generation waits for the actor the guest's script will make.
+inline ActivationAction DecideActivation(const net::coop::EventState& state, const ActivationLedger& ledger,
+                                         bool has_the_actor) {
+    if (!IsUnitDescriptor(state.activation.descriptor_offset)) return ActivationAction::kReject;
+    if (has_the_actor && ledger.generations.empty() && ledger.own > 0) return ActivationAction::kAdopt;
+    return ActivationAction::kWait;
+}
+
+// The guest's own script activated an object of the level: it takes the
+// generation of the host that goes with it, if there is one.
+//
+// It returns true when a generation of the host was taken. When there is
+// none, the actor keeps the generation of the guest's own counter, and the
+// host's word for it will be adopted when it comes.
+inline bool TakeGeneration(ActivationLedger* ledger, uint32_t* generation) {
+    if (!ledger) return false;
+    if (ledger->generations.empty()) {
+        ledger->own++;
+        return false;
+    }
+    *generation = ledger->generations.front();
+    ledger->generations.erase(ledger->generations.begin());
+    return true;
+}
 
 // The log vocabulary of the co-op: "coop: <verb> key=value key=value ...".
 // The keys are lowercase, there is no space around the "=" and no value

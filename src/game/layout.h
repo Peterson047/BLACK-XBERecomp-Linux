@@ -112,12 +112,18 @@ constexpr uint32_t kActorDirection = 0x20; // the world direction the engine kee
 constexpr uint32_t kActorLocalDirection = 0x60;  // the direction in the actor's own frame
 constexpr uint32_t kActorBasis = 0x70;           // the matrix's three rows: 0x70, 0x80, 0x90
 
+// The table of the units of the level. The descriptor of an activation is
+// one of its places: the unit the actor comes from.
+constexpr uint32_t kActorUnitTable = 0x7A20;
+constexpr uint32_t kActorUnitStride = 0x40;// The size of the manager's block, so a descriptor that is not a unit can be
+// refused instead of read.
+constexpr uint32_t kActorManagerSize = 0x8540;
+
 // the engine's own calls the world layer drives
 constexpr uint32_t kSetDirection = 0x001CE600;  // the actor's direction
 constexpr uint32_t kSetPosition = 0x001CE660;   // the actor's position
 constexpr uint32_t kDamageMethod = 0x001DF830;  // the actor's damage
 constexpr uint32_t kActorTick = 0x001F08D0;     // the actor's tick, once a frame
-
 // the damage event the engine hands to the damage routine: the origin, the
 // damage, the radius, the type and the flag
 constexpr uint32_t kDamageEventOrigin = 0x00;

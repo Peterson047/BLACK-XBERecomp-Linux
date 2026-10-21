@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "game/coop_world_pure.h"
@@ -51,6 +52,13 @@ enum class Role : uint8_t {
     kOffline = 0,
     kHost = 1,
     kGuest = 2,
+};
+
+// What the replay of a damage did.
+enum class ReplayResult {
+    kApplied,   // the damage went into the actor
+    kSkipped,   // the actor was not there to be damaged, and it will not be
+    kNoActor,   // the actor is not there yet: it may come
 };
 
 // The damage the engine's own routine was given, as the hook caught it.
@@ -72,6 +80,26 @@ struct DamageCall {
     // part in the next. The damage routine reads them and skips the damage
     // for some body parts, so the guest has to have the same.
     uint32_t hit_state = 0;
+};
+
+// The activation of an actor, as the engine's own routine was given it.
+//
+// The activation is 0x001DA4F0(actor, descriptor, third, ...). The actor is
+// the one the engine gives, the descriptor is the unit of the level the actor
+// comes from, and the third is the value the routine takes in a register.
+// The rest of the arguments are the identity of the object, the transform of
+// the spawn and four values of the level script.
+struct ActivationCall {
+    uint32_t actor = 0;
+    uint32_t descriptor = 0;
+    uint32_t third = 0;
+    uint32_t key_a = 0;
+    uint32_t key_b = 0;
+    uint32_t arg6 = 0;
+    uint32_t arg7 = 0;
+    uint32_t arg8 = 0;
+    uint32_t arg9 = 0;
+    float transform[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 };
 
 class World {
@@ -124,6 +152,42 @@ public:
     void SetEventPublisher(EventPublisher publisher) { publisher_ = std::move(publisher); }
     std::vector<net::coop::Event> TakePendingEvents();
 
+    // The host: the engine activated an actor.
+    //
+    // The two copies of the level do not activate the same objects at the
+    // same time - the level script reacts to where the player is, and the
+    // two players are in different places - so the host tells the guest
+    // which actor of the level it activated. The guest is never a source:
+    // it activates only what the host named.
+    void PublishActivation(const ActivationCall& call);
+
+    // The guest: the host's activation, applied on the engine's thread.
+    //
+    // It runs in the actor's tick, like the damage: the engine's memory is
+    // not to be touched from any other thread.
+    bool ApplyActivation(const net::coop::Event& event);
+
+    // The guest: the engine's own level script activated an actor.
+    //
+    // The guest's script runs the whole level, so it activates the objects
+    // of the level on its own. When it activates one the host has already
+    // activated, the guest's actor takes the host's generation, so the two
+    // sides agree on which actor is which.
+    void AfterGuestActivation(uint32_t actor, uint32_t key_a, uint32_t key_b);
+
+    // What the host published about one object of the level.
+    //
+    // The host activates the same object more than once - the level script
+    // brings it back - so the generations of the host are a queue, in the
+    // order the host made them. The guest's own level script activates the
+    // object too, and each of its actors takes the generation of the host
+    // that goes with it.
+    struct HostActivation {
+        uint32_t key_a = 0;
+        uint32_t key_b = 0;
+        ActivationLedger ledger;  // the generations of the host, in order
+    };
+
     // What the world layer counted during the round.
     const WorldCounters& Counters() const { return counters_; }
     uint32_t UnpairedCount() const { return counters_.unpaired; }
@@ -159,7 +223,16 @@ private:
     // calls.
     void WriteActorState(uint32_t actor, const net::coop::ActorState& state);
     // The guest: one damage, through the engine's own damage routine.
-    bool ReplayDamage(const net::coop::Event& event);
+    ReplayResult ReplayDamage(const net::coop::Event& event, uint32_t waits);
+    // The guest: the living actor with this identity, or zero.
+    uint32_t FindLiveActor(uint32_t key_a, uint32_t key_b) const;
+    // The guest: what the host published about this object of the level.
+    HostActivation* FindHostActivation(uint32_t key_a, uint32_t key_b);
+    // The guest: did the host say it has an actor of this object of the
+    // level? The snapshot that carries the actor can be late; the word of
+    // the activation cannot.
+    bool HostPublished(uint32_t key_a, uint32_t key_b);
+    void NoteHostPublished(uint32_t key_a, uint32_t key_b);
 
     Role role_ = Role::kOffline;
     uint32_t epoch_ = 0;
@@ -175,8 +248,23 @@ private:
     uint32_t test_kill_generation_ = 0;
     net::coop::Snapshot pending_snapshot_;
     bool has_pending_snapshot_ = false;
-    std::vector<net::coop::Event> pending_events_;
+    // The events that arrived outside the engine's thread, and how many
+    // times each of them waited for the actor it is about.
+    struct PendingEvent {
+        net::coop::Event event{};
+        uint32_t waits = 0;
+    };
+    std::vector<PendingEvent> pending_events_;
+    // The frame the events were last taken in. The tick of the actor runs
+    // once per actor, and the events are applied once per frame.
+    uint32_t last_event_frame_ = 0;
     std::vector<net::coop::Event> outgoing_events_;
+    // The activations the host published and the guest has not seen the
+    // actor of yet.
+    std::vector<HostActivation> host_activations_;
+    // The objects of the level the host said it activated. The snapshot
+    // that carries the actor can be late; this cannot.
+    std::vector<std::pair<uint32_t, uint32_t>> host_published_;
     EventPublisher publisher_;
 };
 
