@@ -164,7 +164,6 @@ int main(int argc, char** argv) {
 
     bool relaunched = false;
     bool is_host = false;
-    bool is_coop = false;
     uint16_t host_port = net::kDefaultPort;
     std::string connect_ip = "";
     uint16_t connect_port = net::kDefaultPort;
@@ -190,7 +189,7 @@ int main(int argc, char** argv) {
                 }
             }
         } else if (std::strcmp(argv[i], "--coop") == 0) {
-            is_coop = true;
+            // Accepted, and a no-op: the co-op is the only mode there is.
         } else if (std::strcmp(argv[i], "--name") == 0 || std::strcmp(argv[i], "--player-name") == 0) {
             if (i + 1 < argc) {
                 player_name = argv[++i];
@@ -206,17 +205,15 @@ int main(int argc, char** argv) {
     else app::LogSystem();
 
     game::MultiplayerManager::Get().Init();
-    if (is_coop) {
-        // The co-op is a session of its own: the same transport, a different
-        // conversation. See .agents/teamwork/coop/MODE.md.
-        game::coop::Adapter::Get().Enable();
-    }
     if (!player_name.empty()) {
         net::NetworkManager::Get().SetLocalPlayerName(player_name);
     }
     if (is_host) {
+        // A co-op session: the host owns the world and the guest reacts to it.
+        game::coop::Adapter::Get().Enable();
         net::NetworkManager::Get().StartHost(host_port);
     } else if (!connect_ip.empty()) {
+        game::coop::Adapter::Get().Enable();
         net::NetworkManager::Get().ConnectTo(connect_ip, connect_port);
     }
 
