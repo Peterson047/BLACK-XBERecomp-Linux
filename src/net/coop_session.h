@@ -16,6 +16,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <vector>
 
 #include "net/coop_protocol.h"
@@ -87,7 +88,15 @@ public:
 
     // What went wrong, and how much. A silent divergence is the worst
     // outcome, so these are visible.
+    //
+    // A hole in the sequence is not a divergence. The host publishes from two
+    // threads, so the packet of the sequence 6 can reach the guest before the
+    // one of the sequence 5; the guest waits for the 5 and the hole closes.
+    // That is a hiccup, and it is counted apart. A hole that is never filled
+    // is a divergence: the two sides do not have the same world.
     uint32_t GetDivergenceCount() const { return divergence_count_; }
+    // The holes in the sequence, filled or not.
+    uint32_t GetHoleCount() const { return hole_count_; }
     uint32_t GetStaleCount() const { return stale_count_; }
     uint32_t GetAppliedEventCount() const { return applied_events_; }
     // The counters that the other threads touch are read under the lock.
@@ -100,8 +109,9 @@ public:
         return static_cast<uint32_t>(unacked_.size());
     }
     uint32_t GetDroppedEventCount() const { return dropped_events_; }
-    // The events that were not published because there was no round.
-    uint32_t GetSkippedEventCount() const { return skipped_events_; }
+    // The events that were not published because there was no round. The
+    // count is made by the thread that runs the engine, so it is atomic.
+    uint32_t GetSkippedEventCount() const { return skipped_events_.load(std::memory_order_acquire); }
     uint32_t GetSentSnapshotCount() const { return sent_snapshots_; }
     uint32_t GetReceivedSnapshotCount() const { return received_snapshots_; }
     // The number of the events that crossed to the other side.
@@ -133,17 +143,21 @@ private:
     bool IsHost() const { return network_.GetMode() == NetMode::Host; }
     bool IsGuest() const { return network_.GetMode() == NetMode::Client; }
 
-    void PublishRoom();
+    void PublishRoom(bool force = false);
     void TryStartRound();
     void SendReady();
     void SendSnapshot();
     void SendEvent(const coop::Event& event);
+    // The packets go out in the order of the sequence numbers.
+    void FlushEvents();
     // The guest tells the host how far it got.
     void SendAck();
     void ResendUnacked();
     void StartRound();
     void ApplyEvent(const coop::Event& event);
     void DrainPending();
+    // The guest: does the host know that this process is on it?
+    bool NeedsReady() const;
 
     NetworkManager& network_;
 
@@ -182,6 +196,7 @@ private:
     struct PendingEvent {
         coop::Event event{};
         uint32_t seq = 0;
+        bool sent = false;  // the packet went out
     };
     // The lock of the state that two threads touch: the thread that publishes
     // the events of the world (the engine's thread, inside the damage
@@ -193,11 +208,29 @@ private:
     uint32_t next_event_seq_ = 0;
     float resend_timer_ = 0.0f;
 
+    // The events that have a number but have not gone out yet. The packets go
+    // out in the order of this list, so the guest never sees a hole because
+    // two threads published at the same time.
+    //
+    // The lock of the sending is its own, and it is only about the order of
+    // the packets: it is never held while the lock of the session is taken,
+    // and the transport's lock is taken with it, which is safe because the
+    // transport never calls back into the session while it holds that lock
+    // and asks for this one.
+    std::mutex send_mutex_;
+    std::vector<coop::Event> to_send_;
+
     // The guest's view of the events: the last one applied, and the ones
     // that arrived early and wait for their turn.
     uint32_t last_applied_seq_ = 0;
     std::map<uint32_t, coop::Event> pending_events_;
 
+    // The holes of the sequence: the numbers that are missing and the ones
+    // that turned up. A hole that turns up is a hiccup; a hole that does not
+    // is a divergence.
+    std::set<uint32_t> open_holes_;
+    std::vector<uint32_t> filled_holes_;
+    uint32_t hole_count_ = 0;
     uint32_t divergence_count_ = 0;
     uint32_t stale_count_ = 0;
     uint32_t applied_events_ = 0;
@@ -205,13 +238,17 @@ private:
     // The events the guest acknowledged: the number of the events that
     // crossed, seen from the host.
     uint32_t crossed_events_ = 0;
-    // The events that were published outside a round and did not go out.
-    uint32_t skipped_events_ = 0;
+    // The events that were published outside a round and did not go out. The
+    // thread that runs the engine counts them, so the count is atomic.
+    std::atomic<uint32_t> skipped_events_{0};
     uint32_t dropped_events_ = 0;
     uint32_t sent_snapshots_ = 0;
     uint32_t received_snapshots_ = 0;
     uint32_t acks_sent_ = 0;
     float room_timer_ = 0.0f;
+    // The clock of the guest's "I am on it": the datagram that says it can
+    // be lost, and the pair would wait for it for the rest of the session.
+    float ready_timer_ = 0.0f;
 
     float lobby_timeout_ = 5.0f;
     float loading_timeout_ = 30.0f;

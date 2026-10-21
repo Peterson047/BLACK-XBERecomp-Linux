@@ -220,8 +220,28 @@ public:
 private:
     World() = default;
 
+    // One actor of the copy: the pointer of the actor and its state.
+    //
+    // The copy is taken by the engine's own thread, so the thread that draws
+    // never reads the engine's memory.
+    struct ActorCopy {
+        uint32_t actor = 0;            // the pointer of the actor
+        net::coop::ActorState state{};  // its identity and its state
+    };
+
     // The actors the manager holds, and their identities.
     uint32_t EnumerateActors(std::vector<uint32_t>* actors) const;
+    // The engine's thread: the copy of the live actors.
+    //
+    // The thread that draws must not read the engine's memory: the engine
+    // changes it while it runs, and the list of the actors can lose a slot
+    // between the read of the pointer and the read of the actor, which is a
+    // wild read in the address space of the host. So the engine's own thread
+    // takes a copy of what the other thread needs, and the other thread
+    // works on the copy.
+    void TakeActorCopy();
+    // The copy the engine's thread left, read under the lock.
+    std::vector<ActorCopy> CopyActors();
     // The host: one actor's state for the snapshot.
     void ReadActorState(uint32_t actor, net::coop::ActorState* state) const;
     // The guest: the host's state onto one actor, through the engine's own
@@ -229,6 +249,18 @@ private:
     void WriteActorState(uint32_t actor, const net::coop::ActorState& state);
     // The guest: one damage, through the engine's own damage routine.
     ReplayResult ReplayDamage(const net::coop::Event& event, uint32_t waits);
+    // The guest: the events that arrived outside the engine's thread, in the
+    // order of the sequence. An event that waits for its actor holds the
+    // ones behind it: the order of the events is the order of the protocol.
+    void ProcessPendingEvents();
+    // The guest: the event goes into the queue, in the order of the
+    // sequence.
+    void QueueEvent(const net::coop::Event& event);
+    // The guest: the position of the host's actor with this identity, from
+    // the snapshot of the host. It is the position of the actor, and not the
+    // point of the impact, so it tells two actors of the same object of the
+    // level apart.
+    bool HostActorPosition(const net::coop::EventState& state, float* position);
     // The guest: the living actor with this identity, or zero.
     uint32_t FindLiveActor(uint32_t key_a, uint32_t key_b) const;
     // The guest: what the host published about this object of the level.
@@ -268,6 +300,10 @@ private:
     bool has_pending_snapshot_ = false;
     // The events that arrived outside the engine's thread, and how many
     // times each of them waited for the actor it is about.
+    //
+    // The queue is in the order of the sequence: an event that waits for
+    // its actor stays at the head of the queue, and the events behind it
+    // wait for it. The engine's death chain is not safe out of order.
     struct PendingEvent {
         net::coop::Event event{};
         uint32_t waits = 0;
@@ -276,6 +312,11 @@ private:
     // The frame the events were last taken in. The tick of the actor runs
     // once per actor, and the events are applied once per frame.
     uint32_t last_event_frame_ = 0;
+    // The copy of the live actors, taken by the engine's own thread. The
+    // thread that draws works on this and never on the engine's memory.
+    std::vector<ActorCopy> actor_copy_;
+    bool actor_copy_valid_ = false;
+    uint32_t last_copy_frame_ = 0;
     std::vector<net::coop::Event> outgoing_events_;
     // The activations the host published and the guest has not seen the
     // actor of yet. The guest's own script activates the objects of the

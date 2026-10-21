@@ -52,8 +52,10 @@ std::string Safe(const char* text, size_t max) {
     return out;
 }
 
-// The bus of this process, the one the engine's own events go to.
-uint32_t g_bus = 0;
+// The bus of this process, the one the engine's own events go to. The
+// thread that fires the events writes it and the thread that replays them
+// reads it, so it is atomic.
+std::atomic<uint32_t> g_bus{0};
 
 }  // namespace
 
@@ -81,7 +83,6 @@ void Mission::ResetRound(uint32_t epoch) {
     divergence_logged_ = false;
     divergence_count_ = 0;
     divergence_done_ = 0;
-    sequence_ = 0;
     published_count_ = 0;
     published_done_ = 0;
     // The state of the objectives is published again in the new round: the
@@ -90,28 +91,55 @@ void Mission::ResetRound(uint32_t epoch) {
     objective_logged_ = false;
     outbox_.clear();
     inbox_.clear();
+    // The events of the guest's own engine belong to the round they were
+    // fired in. Keeping them would make the next round find twins that do
+    // not exist, and the guest would not fire the host's events at all.
+    local_events_.clear();
+    local_pushed_ = 0;
+    local_matched_ = 0;
 }
 
 void Mission::BeginFire(uint32_t kind) {
-    kind_ = uint8_t(kind);
-    has_kind_ = true;
+    kind_.store(uint8_t(kind), std::memory_order_relaxed);
+    has_kind_.store(true, std::memory_order_release);
 }
 
-void Mission::EndFire() { has_kind_ = false; }
+void Mission::EndFire() { has_kind_.store(false, std::memory_order_release); }
 
 void Mission::OnBusEvent(uint32_t bus, const char* name, const char* text, const float pos[3], uint32_t count) {
-    if (bus) g_bus = bus;
-    if (replaying_) return;  // the guest is firing the host's event: not a new one
+    if (bus) g_bus.store(bus, std::memory_order_release);
 
     NamedEvent event;
     std::snprintf(event.name, sizeof(event.name), "%s", name ? name : "");
     std::snprintf(event.text, sizeof(event.text), "%s", text ? text : "");
     event.count = count;
-    event.kind = has_kind_ ? kind_ : 0;
+    event.kind = has_kind_.load(std::memory_order_acquire) ? kind_.load(std::memory_order_relaxed) : 0;
     event.pos[0] = pos[0];
     event.pos[1] = pos[1];
     event.pos[2] = pos[2];
     event.event_id = NameHash(event.name, std::strlen(event.name));
+    const std::string key = EventKey(event);
+
+    // The guest is firing the event of the host in its own bus, and the
+    // engine gives the event back: that one is the answer to the call, not
+    // a new event.
+    //
+    // The window is open only around the call, and only the event that was
+    // asked for is the answer to it. An event of the guest's own that
+    // happens to arrive while the window is open is NOT lost: it is the
+    // twin of a host event that is still to come, and dropping it would
+    // make the guest fire that host event too.
+    if (replaying_.load(std::memory_order_acquire)) {
+        bool ours = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!replay_seen_ && replay_key_ == key) {
+                replay_seen_ = true;
+                ours = true;
+            }
+        }
+        if (ours) return;
+    }
 
     if (!IsHost()) {
         // The guest's own engine fired the event: it happens here as the
@@ -119,8 +147,9 @@ void Mission::OnBusEvent(uint32_t bus, const char* name, const char* text, const
         // the host is not fired a second time: the two would count the same
         // objective twice.
         std::lock_guard<std::mutex> lock(mutex_);
-        local_events_.push_back(EventKey(event));
-        while (local_events_.size() > 256) local_events_.pop_front();
+        local_events_.push_back(key);
+        while (local_events_.size() > kLocalEventCapacity) local_events_.pop_front();
+        local_pushed_++;
         return;
     }
 
@@ -233,7 +262,9 @@ bool Mission::NextEvent(net::coop::Event* out) {
     *out = outbox_.front();
     outbox_.pop_front();
     out->state.start_epoch = Epoch();
-    out->state.event_seq = ++sequence_;
+    // The number of the sequence is the session's: it is the number of the
+    // event in the round, and the session gives it when the event goes out.
+    // A number of its own here would be written and never read.
     return true;
 }
 
@@ -330,15 +361,18 @@ void Mission::ApplyPending() {
                     // copy of the host would count the same objective twice.
                     LOGI("coop: event epoch=%u id=%u kind=%u name=%s count=%u replayed=0", Epoch(), named.event_id,
                          named.kind, Safe(named.name, sizeof(named.name)).c_str(), named.count);
-                    break;
+                } else {
+                    LOGI("coop: event epoch=%u id=%u kind=%u name=%s count=%u pos=%g,%g,%g replayed=1", Epoch(),
+                         named.event_id, named.kind, Safe(named.name, sizeof(named.name)).c_str(), named.count,
+                         named.pos[0], named.pos[1], named.pos[2]);
+                    FireLocal(named);
                 }
-                LOGI("coop: event epoch=%u id=%u kind=%u name=%s count=%u pos=%g,%g,%g replayed=1", Epoch(),
-                     named.event_id, named.kind, Safe(named.name, sizeof(named.name)).c_str(), named.count,
-                     named.pos[0], named.pos[1], named.pos[2]);
-                FireLocal(named);
                 {
                     // The counter is read by the thread that draws the
-                    // summary, so it is written under the lock.
+                    // summary, so it is written under the lock. The event
+                    // of the host counts even when the guest had it
+                    // already: the two sides have to count the same number
+                    // of events of the host.
                     std::lock_guard<std::mutex> lock(mutex_);
                     events_++;
                 }
@@ -417,12 +451,27 @@ bool Mission::HasTwin(const NamedEvent& event) {
     // The guest's own engine fires the same events as the host's, one frame
     // or two earlier. The copy of the host that has a twin here is not fired
     // again: the objective would be counted twice.
+    //
+    // The queue of the guest's own events is searched WHOLE and the element
+    // that matches is the one that is erased. The two copies of the level
+    // run different scripts, so the two sequences do not match one by one:
+    // looking only at the head of the queue gives up at the first
+    // difference, and from then on the guest fires the host's copy of every
+    // event and keeps its own, which counts every objective twice and ends
+    // the round on the guest while the host is still playing.
     const std::string key = EventKey(event);
     std::lock_guard<std::mutex> lock(mutex_);
-    if (local_events_.empty()) return false;
-    if (local_events_.front() != key) return false;
-    local_events_.pop_front();
+    if (!MatchTwin(&local_events_, key)) return false;
+    local_matched_++;
     return true;
+}
+
+uint32_t Mission::Unmatched() const {
+    // The events of the guest's own engine that the host's copy never
+    // matched. They are the ones that are still in the queue, and the ones
+    // that the queue had to throw away to make room.
+    std::lock_guard<std::mutex> lock(mutex_);
+    return local_pushed_ - local_matched_;
 }
 
 void Mission::FireLocal(const NamedEvent& event) {
@@ -436,7 +485,8 @@ void Mission::FireLocal(const NamedEvent& event) {
     // the trigger of the event, and the trigger is a runtime object of the
     // host, whose address says nothing in the guest. What the event carries
     // is what the bus takes, and that is what is replicated.
-    uint32_t bus = g_bus ? g_bus : R32(kEventBus);
+    uint32_t bus = g_bus.load(std::memory_order_acquire);
+    if (!bus) bus = R32(kEventBus);
     if (!bus) {
         LOGE("coop: error epoch=%u what=no_bus", Epoch());
         unpaired_++;
@@ -467,10 +517,24 @@ void Mission::FireLocal(const NamedEvent& event) {
     // The call into the engine has to happen on the thread that runs the
     // guest, the same way the world layer does it.
     X86Context& ctx = CurrentContext();
-    replaying_ = true;
+
+    // The window of the replay: the event that comes back from the engine
+    // is the answer to this call, and not a new event of the guest. The
+    // key of the event that is fired is what tells the two apart, because
+    // the window is open and another event of the guest can arrive in it.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        replay_key_ = EventKey(event);
+        replay_seen_ = false;
+    }
+    replaying_.store(true, std::memory_order_release);
     ctx.eax = bus;
     CallGuest(ctx, kQueueEvent, {name, text, pos, event.count});
-    replaying_ = false;
+    replaying_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        replay_key_.clear();
+    }
 
     // The block goes back to the guest's heap. The engine copied the name,
     // the text and the position into its own slot of the bus (the copy of
@@ -488,6 +552,15 @@ void Mission::LogSummary() const {
                             unpaired_.load(std::memory_order_acquire),
                             divergent_.load(std::memory_order_acquire))
                        .c_str());
+    // The events of the guest's own engine and the ones that found their
+    // twin. The difference is the number of events the guest fired that the
+    // host's copy never matched: a queue that does not drain is visible
+    // here instead of being silent.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        LOGI("coop: twin epoch=%u local=%u matched=%u unmatched=%u", Epoch(), local_pushed_, local_matched_,
+             local_pushed_ - local_matched_);
+    }
     // The guest's memory that the replayed events used. The two numbers have
     // to be the same: a difference is a leak of the guest's address space.
     LOGI("coop: scratch epoch=%u alloc=%u free=%u", Epoch(), scratch_allocs_.load(std::memory_order_acquire),

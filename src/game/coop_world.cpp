@@ -187,26 +187,67 @@ void World::ReadActorState(uint32_t actor, net::coop::ActorState* state) const {
     state->flags = dead ? net::coop::kActorDead : 0;
 }
 
+// The engine's thread: the copy of the live actors.
+//
+// The thread that draws must not read the engine's memory: the engine
+// changes it while it runs. The list of the actors can lose a slot between
+// the read of the pointer and the read of the actor, and the read of an
+// actor that is not there any more is a wild read in the address space of
+// the host. So the engine's own thread takes the copy, and the thread that
+// draws works on the copy.
+void World::TakeActorCopy() {
+    std::vector<uint32_t> actors;
+    EnumerateActors(&actors);
+    std::vector<ActorCopy> copy;
+    copy.reserve(actors.size());
+    for (uint32_t actor : actors) {
+        ActorCopy entry;
+        entry.actor = actor;
+        ReadActorState(actor, &entry.state);
+        copy.push_back(entry);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    actor_copy_ = std::move(copy);
+    actor_copy_valid_ = true;
+}
+
+// The copy the engine's thread left. The lock is the world's own, and it is
+// not held while the code calls out.
+std::vector<World::ActorCopy> World::CopyActors() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return actor_copy_;
+}
+
 bool World::BuildSnapshot(net::coop::Snapshot& out) {
     if (!IsHost()) {
         LOGE("%s", FormatLog("error", {{"reason", "not_the_host"}, {"what", "snapshot"}}).c_str());
         return false;
     }
-    std::vector<uint32_t> actors;
-    uint32_t used = EnumerateActors(&actors);
+    // The actors the engine's own thread copied: the thread that draws does
+    // not read the engine's memory.
+    const std::vector<ActorCopy> actors = CopyActors();
     out = net::coop::Snapshot();
     out.header.start_epoch = epoch_.load(std::memory_order_acquire);
+    if (actors.size() > net::coop::kMaxActorsPerSnapshot) {
+        // A snapshot that does not fit is not sent: the guest would take it
+        // for the whole world and the actors that are missing would be
+        // missing for good. The live list of the manager holds sixteen
+        // actors, so this cannot happen with this engine, but the code does
+        // not send a truncated world.
+        counters_.divergent++;
+        LOGE("coop: error reason=snapshot_too_big actors=%zu", actors.size());
+        return false;
+    }
     uint32_t count = 0;
-    for (uint32_t actor : actors) {
-        if (count >= net::coop::kMaxActorsPerSnapshot) break;
-        ReadActorState(actor, &out.actors[count]);
+    for (const ActorCopy& entry : actors) {
+        out.actors[count] = entry.state;
         count++;
     }
     out.header.actor_count = count;
     counters_.snapshots++;
     LOGI("%s", FormatLog("snapshot", {{"epoch", std::to_string(epoch_.load(std::memory_order_acquire))},
                                        {"actors", std::to_string(count)},
-                                       {"used", std::to_string(used)}})
+                                       {"used", std::to_string(count)}})
                        .c_str());
     return true;
 }
@@ -227,20 +268,21 @@ bool World::ApplySnapshot(const net::coop::Snapshot& snapshot) {
     if (snapshot.header.start_epoch > epoch_.load(std::memory_order_acquire))
         SetEpoch(snapshot.header.start_epoch);
 
-    // the guest's actors and their identities
-    std::vector<uint32_t> actors;
-    EnumerateActors(&actors);
+    // the guest's actors and their identities, from the copy the engine's
+    // own thread left: the thread that draws does not read the engine's
+    // memory.
+    const std::vector<ActorCopy> actors = CopyActors();
     std::vector<ActorIdentity> identities;
     identities.reserve(actors.size());
-    for (uint32_t actor : actors) {
+    for (const ActorCopy& entry : actors) {
         ActorIdentity identity;
-        identity.native_a = R32(actor + layout::coop::kActorKeyA);
-        identity.native_b = R32(actor + layout::coop::kActorKeyB);
-        identity.generation = R32(actor + layout::coop::kActorGeneration);
-        identity.type = static_cast<uint16_t>(R32(actor + layout::coop::kActorType));
-        identity.pos[0] = G<float>(actor + layout::coop::kActorPosition);
-        identity.pos[1] = G<float>(actor + layout::coop::kActorPosition + 4);
-        identity.pos[2] = G<float>(actor + layout::coop::kActorPosition + 8);
+        identity.native_a = entry.state.native_a;
+        identity.native_b = entry.state.native_b;
+        identity.generation = entry.state.generation;
+        identity.type = entry.state.type;
+        identity.pos[0] = entry.state.pos[0];
+        identity.pos[1] = entry.state.pos[1];
+        identity.pos[2] = entry.state.pos[2];
         identities.push_back(identity);
     }
     Pairing pairing = PairActors(identities, snapshot);
@@ -268,10 +310,14 @@ bool World::ApplySnapshot(const net::coop::Snapshot& snapshot) {
     // The two lines say when the pairing changed, not every frame: a log
     // that says the same thing a hundred times hides the one time it
     // changes, and the gate reads this log.
+    //
+    // The count is the adjusted one, the same that the summary prints: the
+    // raw count counts the actors of the guest that the host has not
+    // activated yet, and those are not a failure.
     if (unpaired != last_unpaired_) {
         last_unpaired_ = unpaired;
         LOGI("%s", FormatLog("unpaired", {{"side", "guest"},
-                                          {"count", std::to_string(pairing.unpaired)},
+                                          {"count", std::to_string(unpaired)},
                                           {"epoch", std::to_string(epoch_.load(std::memory_order_acquire))}})
                            .c_str());
     }
@@ -293,7 +339,7 @@ bool World::ApplySnapshot(const net::coop::Snapshot& snapshot) {
     if (Current()) {
         for (size_t i = 0; i < actors.size(); i++) {
             if (pairing.guest_to_snapshot[i] < 0) continue;
-            WriteActorState(actors[i], snapshot.actors[pairing.guest_to_snapshot[i]]);
+            WriteActorState(actors[i].actor, snapshot.actors[pairing.guest_to_snapshot[i]]);
         }
     }
     LOGI("%s", FormatLog("apply", {{"kind", "snapshot"},
@@ -393,17 +439,32 @@ ReplayResult World::ReplayDamage(const net::coop::Event& event, uint32_t waits) 
         if (candidates.size() == 1) {
             actor = candidates.front();
         } else if (candidates.size() > 1) {
-            float best_distance = 0.0f;
-            for (uint32_t candidate : candidates) {
-                const float dx = G<float>(candidate + layout::coop::kActorPosition) - state.pos[0];
-                const float dy = G<float>(candidate + layout::coop::kActorPosition + 4) - state.pos[1];
-                const float dz = G<float>(candidate + layout::coop::kActorPosition + 8) - state.pos[2];
-                const float distance = dx * dx + dy * dy + dz * dz;
-                if (!actor || distance < best_distance) {
-                    actor = candidate;
-                    best_distance = distance;
+            // The position that tells them apart is the position of the
+            // actor, and not the point of the impact: the impact is where
+            // the hit landed, and it says nothing about which actor of the
+            // script object was hit. The host's snapshot carries the actor
+            // with the whole identity, so the position of the host's actor
+            // is the one that identifies it.
+            float host_position[3] = {0.0f, 0.0f, 0.0f};
+            if (HostActorPosition(state, host_position)) {
+                float best_distance = 0.0f;
+                for (uint32_t candidate : candidates) {
+                    const float dx = G<float>(candidate + layout::coop::kActorPosition) - host_position[0];
+                    const float dy = G<float>(candidate + layout::coop::kActorPosition + 4) - host_position[1];
+                    const float dz = G<float>(candidate + layout::coop::kActorPosition + 8) - host_position[2];
+                    const float distance = dx * dx + dy * dy + dz * dz;
+                    if (!actor || distance < best_distance) {
+                        actor = candidate;
+                        best_distance = distance;
+                    }
                 }
+                // The candidate that is too far away is another actor: the
+                // damage is not put in it.
+                if (best_distance > kPairDistance) actor = 0;
             }
+            // Without the position of the host's actor there is nothing that
+            // tells the candidates apart, and the damage is not put in an
+            // arbitrary one: the world would go on without the death.
         }
     }
     if (!actor) {
@@ -538,6 +599,32 @@ uint32_t World::FindLiveActor(uint32_t key_a, uint32_t key_b) const {
         return actor;
     }
     return 0;
+}
+
+// The guest: the position of the host's actor with this identity.
+//
+// The snapshot of the host carries the actor with the whole identity, so the
+// position it has is the position of the actor the event is about. It is the
+// position of the actor and not the point of the impact, and it is what
+// tells two actors of the same script object apart.
+bool World::HostActorPosition(const net::coop::EventState& state, float* position) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!has_pending_snapshot_) return false;
+    const net::coop::Snapshot& snapshot = pending_snapshot_;
+    uint32_t count = snapshot.header.actor_count;
+    if (count > net::coop::kMaxActorsPerSnapshot) count = net::coop::kMaxActorsPerSnapshot;
+    for (uint32_t i = 0; i < count; i++) {
+        const net::coop::ActorState& actor = snapshot.actors[i];
+        if (actor.native_a != state.native_a) continue;
+        if (actor.native_b != state.native_b) continue;
+        if (actor.generation != state.generation) continue;
+        if (actor.type != state.object_type) continue;
+        position[0] = actor.pos[0];
+        position[1] = actor.pos[1];
+        position[2] = actor.pos[2];
+        return true;
+    }
+    return false;
 }
 
 // The host: the engine activated an actor, and the guest has to activate its
@@ -804,8 +891,7 @@ bool World::ApplyEvent(const net::coop::Event& event) {
         // The activation of an actor: it is the engine's memory, so it waits
         // for the engine's thread.
         if (Current()) return ApplyActivation(event);
-        std::lock_guard<std::mutex> lock(mutex_);
-        pending_events_.push_back(PendingEvent{event, 0});
+        QueueEvent(event);
         return true;
     }
     if (state.event_type != static_cast<uint8_t>(net::coop::EventType::ActorDamaged)) {
@@ -814,17 +900,86 @@ bool World::ApplyEvent(const net::coop::Event& event) {
     }
     if (Current()) {
         // the engine runs on a guest thread, and the routine is the engine's
-        return ReplayDamage(event, 0) == ReplayResult::kApplied;
+        const ReplayResult result = ReplayDamage(event, 0);
+        if (result == ReplayResult::kNoActor) {
+            // The actor is not there yet: the damage waits for it, and the
+            // events behind it wait too.
+            QueueEvent(event);
+        }
+        return result == ReplayResult::kApplied;
     }
     // not on a guest thread: the event waits for the next frame of the guest
-    std::lock_guard<std::mutex> lock(mutex_);
-    pending_events_.push_back(PendingEvent{event, 0});
+    QueueEvent(event);
     return true;
+}
+
+// The guest: the event goes into the queue, in the order of the sequence.
+//
+// The queue is in the order of the sequence: the event goes after the ones
+// that are older. An event that waits for its actor holds the ones behind
+// it, because the engine's death chain is not safe out of order and the
+// protocol asks for the activation before the damage of the actor it
+// activated.
+void World::QueueEvent(const net::coop::Event& event) {
+    PendingEvent pending;
+    pending.event = event;
+    pending.waits = 0;
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = pending_events_.begin();
+    while (it != pending_events_.end() && it->event.state.event_seq < event.state.event_seq) ++it;
+    pending_events_.insert(it, pending);
+}
+
+// The guest: the events that arrived outside the engine's thread, in the
+// order of the sequence.
+//
+// The event that waits for its actor stays at the head of the queue and the
+// ones behind it wait for it: the order of the events is the order of the
+// protocol, and the engine's death chain is not safe out of order.
+void World::ProcessPendingEvents() {
+    while (true) {
+        PendingEvent item;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (pending_events_.empty()) break;
+            item = pending_events_.front();
+            pending_events_.erase(pending_events_.begin());
+        }
+        if (item.event.state.event_type == static_cast<uint8_t>(net::coop::EventType::ActorActivated)) {
+            // The activation comes before the damage of the actor it
+            // activated, or the guest would have no actor to damage.
+            ApplyActivation(item.event);
+            continue;
+        }
+        const ReplayResult result = ReplayDamage(item.event, item.waits);
+        if (result == ReplayResult::kNoActor && item.waits < kMaxActorWaits) {
+            // The actor of the damage is not in the world yet: the guest's
+            // own level script activates the objects of the level at its own
+            // pace, so the actor comes a frame or two later. The damage
+            // waits for it at the head of the queue.
+            item.waits++;
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending_events_.insert(pending_events_.begin(), item);
+            break;
+        }
+    }
 }
 
 // The guest: the actor's own tick ran, so the host's transform goes in now.
 // The tick of the guest would overwrite it otherwise (LAYOUT.md §6).
 void World::AfterActorTick(uint32_t actor) {
+    // The frame the engine is in. The tick of the actor runs once per actor
+    // and the frame is the same for all of them.
+    const uint32_t frame = R32(layout::coop::kFrameCount);
+
+    // The copy of the live actors, for the thread that draws. The engine's
+    // own thread takes it, once per frame: the thread that draws must not
+    // read the engine's memory.
+    if (frame != last_copy_frame_) {
+        last_copy_frame_ = frame;
+        TakeActorCopy();
+    }
+
     // The test harness's kill, on the engine's own thread: the damage goes
     // through the engine's routine, so the host publishes it and the guest
     // replays it. It is the host that kills, so it happens before the guest
@@ -832,10 +987,14 @@ void World::AfterActorTick(uint32_t actor) {
     // The kill of the test harness: the thread that draws arms it and the
     // thread that runs the engine fires it, so the actor is taken under the
     // lock and the arm is taken with it.
+    //
+    // The generation is checked here: the arm was made from the copy, and
+    // the slot of the actor can be given to another one in the meantime.
     uint32_t target = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (test_kill_actor_ && actor == test_kill_actor_) {
+        if (test_kill_actor_ && actor == test_kill_actor_ &&
+            R32(actor + layout::coop::kActorGeneration) == test_kill_generation_) {
             target = test_kill_actor_;
             test_kill_actor_ = 0;
         }
@@ -876,34 +1035,11 @@ void World::AfterActorTick(uint32_t actor) {
     //
     // The tick of the actor runs once per actor, and the events are applied
     // once per frame: a damage that waits for its actor is tried again in
-    // the next frame, not in the next actor.
-    std::vector<PendingEvent> events;
-    const uint32_t frame = R32(layout::coop::kFrameCount);
+    // the next frame, not in the next actor. The queue keeps the order of
+    // the sequence, so an event that waits holds the ones behind it.
     if (frame != last_event_frame_) {
         last_event_frame_ = frame;
-        std::lock_guard<std::mutex> lock(mutex_);
-        events.swap(pending_events_);
-    }
-    std::vector<PendingEvent> waiting;
-    for (PendingEvent& item : events) {
-        if (item.event.state.event_type == static_cast<uint8_t>(net::coop::EventType::ActorActivated)) {
-            // The activation comes before the damage of the actor it
-            // activated, or the guest would have no actor to damage.
-            ApplyActivation(item.event);
-            continue;
-        }
-        if (ReplayDamage(item.event, item.waits) == ReplayResult::kNoActor && item.waits < kMaxActorWaits) {
-            // The actor of the damage is not in the world yet: the guest's
-            // own level script activates the objects of the level at its own
-            // pace, so the actor comes a frame or two later. The damage
-            // waits for it.
-            item.waits++;
-            waiting.push_back(item);
-        }
-    }
-    if (!waiting.empty()) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const PendingEvent& item : waiting) pending_events_.push_back(item);
+        ProcessPendingEvents();
     }
 
     // the host's state of this actor
@@ -956,28 +1092,32 @@ void World::AfterActorTick(uint32_t actor) {
 // death chain runs on both sides.
 bool World::ArmTestKill() {
     if (!IsHost()) return false;
-    std::vector<uint32_t> actors;
-    EnumerateActors(&actors);
+    // The copy the engine's own thread left: the thread that draws does not
+    // read the engine's memory.
+    const std::vector<ActorCopy> actors = CopyActors();
     uint32_t best = 0;
     uint32_t best_generation = 0xFFFFFFFF;
-    for (uint32_t actor : actors) {
-        if (R32(actor + layout::coop::kActorState) != kActorAlive) continue;
+    uint32_t best_key_a = 0;
+    uint32_t best_key_b = 0;
+    for (const ActorCopy& entry : actors) {
+        // A dead actor is not a target.
+        if (entry.state.flags & net::coop::kActorDead) continue;
         // An actor with a life: a prop has a life field full of rubbish.
-        const float life = G<float>(actor + layout::coop::kActorHealth);
+        const float life = entry.state.health;
         if (!(life > 0.0f) || life > 1000.0f) continue;
         // And an actor the engine gave an identity: the pair at actor+0x08
         // and actor+0x0C is the key it matches objects with, and an actor
         // without one is not a script object.
-        const uint32_t key_a = R32(actor + layout::coop::kActorKeyA);
-        const uint32_t key_b = R32(actor + layout::coop::kActorKeyB);
-        if (key_a == 0 && key_b == 0) continue;
+        if (entry.state.native_a == 0 && entry.state.native_b == 0) continue;
         // The oldest activation: the two copies of the level bring their
         // actors in at their own pace, and the first ones are the ones
         // both have.
-        const uint32_t generation = R32(actor + layout::coop::kActorGeneration);
+        const uint32_t generation = entry.state.generation;
         if (best == 0 || generation < best_generation) {
-            best = actor;
+            best = entry.actor;
             best_generation = generation;
+            best_key_a = entry.state.native_a;
+            best_key_b = entry.state.native_b;
         }
     }
     // The level spawns its actors while it comes up, so there may be none
@@ -986,9 +1126,9 @@ bool World::ArmTestKill() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         test_kill_actor_ = best;
-        test_kill_key_a_ = R32(best + layout::coop::kActorKeyA);
-        test_kill_key_b_ = R32(best + layout::coop::kActorKeyB);
-        test_kill_generation_ = R32(best + layout::coop::kActorGeneration);
+        test_kill_key_a_ = best_key_a;
+        test_kill_key_b_ = best_key_b;
+        test_kill_generation_ = best_generation;
     }
     LOGI("%s", FormatLog("test", {{"what", "kill"},
                                    {"reason", "armed"},

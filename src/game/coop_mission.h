@@ -39,6 +39,11 @@ constexpr uint32_t kMaxObjectives = 64;
 // engine's thread to apply them.
 constexpr size_t kInboxCapacity = 64;
 
+// How many of the guest's own events are remembered while the host's events
+// come in. The queue is searched whole, so it has to hold the events of the
+// guest that are still waiting for their twin.
+constexpr size_t kLocalEventCapacity = 256;
+
 // How long the same object is not used again: the engine registers the
 // request of use again and again while the player holds the button.
 constexpr std::chrono::milliseconds kInteractionWindow{1000};
@@ -76,11 +81,21 @@ struct ObjectiveState {
 
 // The pure part. It is in coop_mission_logic.cpp.
 
-// The id of a name: the CRC-32 the engine hashes a name with (the table is at
-// 0x2AC908, the polynomial is the usual reflected one). The engine hashes the
-// name without its last character; this does the same, so the id is the
-// engine's own id of the name.
+// The id of a name: the hash the engine hashes a name with (the table is at
+// 0x2AC908, the polynomial is the usual reflected one). The engine hashes
+// every byte of the name, the zero at the end is not part of it, so this is
+// the engine's own id of the name.
 uint32_t NameHash(const char* name, size_t length);
+
+// The twin check: does the guest's own engine already have this event?
+//
+// The key of an event is its name, its text and its count. The queue of the
+// guest's own events is searched whole and the element that matches is the
+// one that is erased: the two copies of the level run different scripts, so
+// the two sequences do not match one by one. True when the guest already
+// had the event, and then the copy of the host is not fired again, or the
+// objective would be counted twice.
+bool MatchTwin(std::deque<std::string>* local_events, const std::string& key);
 
 // The objectives with the state 3.
 uint32_t CountDone(const ObjectiveState& state);
@@ -209,6 +224,13 @@ public:
     uint32_t Unpaired() const { return unpaired_.load(std::memory_order_acquire); }
     uint32_t Divergent() const { return divergent_.load(std::memory_order_acquire); }
 
+    // The events of the guest's own engine that the host's copy never
+    // matched: the queue of the guest's own events does not drain. It is
+    // not an error (the two copies of the level run different scripts), but
+    // a queue that grows is a sign that the two sides do not agree, so it
+    // is counted and shown.
+    uint32_t Unmatched() const;
+
     // The mission is over: every objective of the table is done, or the host
     // said so. The round ends on both sides.
     bool Ended() const { return ended_.load(std::memory_order_acquire); }
@@ -250,10 +272,19 @@ private:
     uint32_t remote_count_ = 0;
     uint32_t remote_done_ = 0;
 
-    bool replaying_ = false;  // the guest is firing an event of the host
-    uint32_t bus_ = 0;        // the bus of this process
-    uint8_t kind_ = 0;        // the kind of the event being fired
-    bool has_kind_ = false;
+    // The kind of the event being fired. The script of the level fires it
+    // and the bus takes it, and the two are not the same call, so the bytes
+    // are atomic: they are written by one thread and read by another.
+    std::atomic<uint8_t> kind_{0};
+    std::atomic<bool> has_kind_{false};
+
+    // The guest is firing an event of the host in its own bus. The window
+    // is open only around the call into the engine, and the key of the
+    // event being fired is under the lock, with the flag that says the
+    // engine already gave it back.
+    std::atomic<bool> replaying_{false};
+    std::string replay_key_;
+    bool replay_seen_ = false;
     // The end of the mission and the summary are written by the thread that
     // runs the engine and by the thread that draws, so they are atomic.
     std::atomic<bool> ended_{false};    // the mission was already announced as over
@@ -268,7 +299,6 @@ private:
     std::chrono::steady_clock::time_point last_interaction_time_{};
     uint32_t last_world_ = 0;         // the world of the last reading
     bool objective_logged_ = false;   // the state of the mission was already logged
-    uint32_t sequence_ = 0;   // the number of the events that went to the network
     uint32_t published_count_ = 0;  // the last state of the mission the host published
     uint32_t published_done_ = 0;
 
@@ -287,7 +317,14 @@ private:
     // The events the guest's own engine fired, in order. The event of the
     // host that has a twin in here is the one the guest already had: it is
     // not fired again, or the objective would be counted twice.
+    //
+    // The two counters are the events that came and the ones that found
+    // their twin: the difference is the number of events of the guest that
+    // the host's copy never matched, and it is what says that the queue is
+    // not draining.
     std::deque<std::string> local_events_;
+    uint32_t local_pushed_ = 0;  // the events the guest's own engine fired
+    uint32_t local_matched_ = 0;  // the ones that found their twin
 };
 }  // namespace coop
 }  // namespace game

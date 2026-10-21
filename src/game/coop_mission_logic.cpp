@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <deque>
 
 namespace game {
 namespace coop {
@@ -36,17 +37,47 @@ const Crc32Table& Table() {
 }  // namespace
 
 uint32_t NameHash(const char* name, size_t length) {
-    // The engine hashes the name without its last character: it counts the
-    // string from its second byte to the byte before the zero
-    // (sub_001F3AC0, x86_recomp.53.cpp:300). The id of a name is the same on
-    // both sides because it is a function of the name alone.
-    size_t bytes = length ? length - 1 : 0;
+    // The engine hashes the WHOLE name.
+    //
+    // sub_001F3AC0 (x86_recomp.53.cpp:300) does "lea esi, [eax+1]" only to
+    // have where the count of the string starts: it walks the string to its
+    // zero, takes the difference ("sub eax,esi" -> the length) and calls
+    // sub_000BF2A0 with ecx = the name and edx = the length. So the hash
+    // covers every byte of the name and not the zero at the end.
+    //
+    // The shift of the engine is arithmetic ("sar eax, 8"), so the id is
+    // not the plain CRC-32: the table of the image is at 0x2AC908 (the
+    // usual reflected table) and the options menu hashes with the same
+    // recipe (src/game/options_menu.cpp:132). The id of a name is the same
+    // on both sides because it is a function of the name alone.
     const Crc32Table& table = Table();
     uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < bytes; i++) {
-        crc = table.entries[(crc ^ static_cast<uint8_t>(name[i])) & 0xFF] ^ (crc >> 8);
+    for (size_t i = 0; i < length; i++) {
+        // The engine reads the byte with "movsx", so a byte with the high
+        // bit set would take the index out of the table. The names of the
+        // events are ascii, and the low byte is what the table is indexed
+        // with.
+        crc = uint32_t(int32_t(crc) >> 8) ^ table.entries[(crc ^ static_cast<uint8_t>(name[i])) & 0xFF];
     }
     return crc;
+}
+
+bool MatchTwin(std::deque<std::string>* local_events, const std::string& key) {
+    // The twin check: does the guest's own engine already have this event?
+    //
+    // The queue of the guest's own events is searched WHOLE and the element
+    // that matches is the one that is erased. The two copies of the level
+    // run different scripts, so the two sequences do not match one by one:
+    // looking only at the head of the queue gives up at the first
+    // difference, and from then on the guest fires the host's copy of every
+    // event and keeps its own, which counts every objective twice.
+    if (!local_events) return false;
+    for (auto it = local_events->begin(); it != local_events->end(); ++it) {
+        if (*it != key) continue;
+        local_events->erase(it);
+        return true;
+    }
+    return false;
 }
 
 uint32_t CountDone(const ObjectiveState& state) {

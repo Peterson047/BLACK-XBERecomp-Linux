@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <stdexcept>
 #include <string>
 
@@ -127,18 +128,94 @@ void TestNameHash() {
     CHECK(NameHash(name, std::strlen(name)) == NameHash(name, std::strlen(name)));
     CHECK(NameHash(name, std::strlen(name)) != 0);
 
+    // The engine hashes the WHOLE name: sub_001F3AC0 counts the string to
+    // its zero and calls sub_000BF2A0 with the name and its length, so the
+    // id is the engine's own id of the name. The shift of the engine is
+    // arithmetic, so the id is not the plain CRC-32.
+    CHECK(NameHash(name, std::strlen(name)) == 0x0F465F7Du);
+    CHECK(NameHash("FE_PRIMARYOBJ_NEW", std::strlen("FE_PRIMARYOBJ_NEW")) == 0x2A4A8C90u);
+
     // Two names of the same length are two ids.
     const char* other = "FE_PRIMARYOBJ_NEW_";
     CHECK(NameHash(name, std::strlen(name)) != NameHash(other, std::strlen(other)));
 
-    // The engine hashes the name without its last character, so two names that
-    // differ only in the last character have the same id.
+    // The last character is part of the name: two names that differ only in
+    // it have different ids.
     const char* twin = "FE_PRIMARYOBJ_DONF";
     CHECK(std::strlen(twin) == std::strlen(name));
-    CHECK(NameHash(name, std::strlen(name)) == NameHash(twin, std::strlen(twin)));
+    CHECK(NameHash(name, std::strlen(name)) != NameHash(twin, std::strlen(twin)));
 
     // An empty name has the id of nothing.
     CHECK(NameHash("", 0) == 0xFFFFFFFFu);
+}
+
+// The twin check.
+//
+// The guest's own engine fires the same events as the host's, and the copy
+// of the host that the guest already had is not fired again: the objective
+// would be counted twice. The queue of the guest's own events is searched
+// whole, because the two copies of the level run different scripts and the
+// two sequences do not match one by one.
+void TestTwinMatch() {
+    using game::coop::MatchTwin;
+
+    std::deque<std::string> local;
+    local.push_back("FE_PRIMARYOBJ_NEW|0");
+    local.push_back("FE_PRIMARYOBJ_DONE|0");
+    local.push_back("LX_DESTRUCTION|0");
+
+    // The event the guest already fired itself: the copy of the host is not
+    // fired again, and the element that matched is the one that is erased.
+    CHECK(MatchTwin(&local, "FE_PRIMARYOBJ_DONE|0"));
+    CHECK(local.size() == 2);
+    CHECK(local[0] == "FE_PRIMARYOBJ_NEW|0");
+    CHECK(local[1] == "LX_DESTRUCTION|0");
+
+    // The same event a second time: the guest had it only once, so the
+    // second copy of the host is fired.
+    CHECK(!MatchTwin(&local, "FE_PRIMARYOBJ_DONE|0"));
+
+    // The event the guest has not seen: it is fired.
+    CHECK(!MatchTwin(&local, "FE_PRIMARYOBJ_FAILED|0"));
+    CHECK(local.size() == 2);
+
+    // The order of the two copies of the level does not matter: the queue is
+    // searched whole, so a host event that is not at the head of the queue
+    // still finds its twin, and the queue does not lose the others.
+    std::deque<std::string> other;
+    other.push_back("A|0");
+    other.push_back("B|0");
+    other.push_back("C|0");
+    CHECK(MatchTwin(&other, "C|0"));
+    CHECK(other.size() == 2);
+    CHECK(other[0] == "A|0");
+    CHECK(other[1] == "B|0");
+    CHECK(MatchTwin(&other, "A|0"));
+    CHECK(other.size() == 1);
+    CHECK(other[0] == "B|0");
+    CHECK(!MatchTwin(&other, "A|0"));
+    CHECK(other.size() == 1);
+
+    // A queue that is empty has no twin: every event of the host is fired.
+    std::deque<std::string> empty;
+    CHECK(!MatchTwin(&empty, "A|0"));
+    CHECK(!MatchTwin(nullptr, "A|0"));
+
+    // The rule of the guest, end to end: the event of the host is fired
+    // only when the guest did not have it. The queue of the guest's own
+    // events is what says it, and the order of the two sequences does not
+    // matter.
+    std::deque<std::string> own;
+    own.push_back("A|0");
+    own.push_back("B|0");
+    const char* const host_events[] = {"B|0", "C|0", "A|0"};
+    int fired = 0;
+    for (const char* host : host_events) {
+        if (MatchTwin(&own, host)) continue;  // the guest had it: not fired again
+        fired++;                             // the guest did not have it: fired
+    }
+    CHECK(fired == 1);  // only "C|0" was new to the guest
+    CHECK(own.empty());
 }
 
 void TestSummaryLine() {
@@ -209,6 +286,7 @@ int main() {
     TestSameObjectives();
     TestMissionFinished();
     TestNameHash();
+    TestTwinMatch();
     TestSummaryLine();
     TestEventQueueing();
     puts("coop mission test passed");
