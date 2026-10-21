@@ -63,9 +63,7 @@ Os logs de `logs/coop-*.log` são de execuções reais de duas instâncias.
   (a chave do motor para o objeto de script) continua igual, então o
   emparelhamento tem uma segunda chance por posição.
 
-## 4. O que falta: a ativação dos atores
-
-**Esta é a próxima peça, e é a mais importante que falta.**
+## 4. A ativação dos atores (resolvida)
 
 Medido numa execução real: às 25 s o convidado tinha **2** atores e o host
 tinha um terceiro que o convidado nunca teve. No fim da execução, com o
@@ -76,28 +74,48 @@ tempo.** O script de level decide quem nasce, e ele reage a onde o jogador
 está. As duas cópias do mundo não são o mesmo mundo enquanto isso não for
 replicado.
 
-O caminho:
+**O que se descobriu** (as provas estão em `LAYOUT.md` §5):
 
-- A ativação é `0x001DA4F0(actor, descriptor, third)`. O `descriptor` vai
-  para `actor+0x320` e é o objeto do script de level; a identidade do par
-  sai dele.
-- O host publica, para cada ator que ele tem e o convidado não tem, o par
-  de identidade, o tipo e a posição.
-- O convidado procura o descritor correspondente nos **dados do próprio
-  level dele** (o mesmo `LevelDat.bin` que os dois carregaram) e chama a
-  ativação com ele.
-- O convidado nunca é a fonte: ele só ativa o que o host mandou.
+- a ativação é `0x001DA4F0(actor, descriptor, third, ...)`: **nove**
+  argumentos na pilha e o `third` no registrador EAX. A identidade do ator
+  **não sai do descritor**: a rotina a recebe nos argumentos 4 e 5 e a
+  escreve no ator (`actor+0x08` e `actor+0x0C`);
+- o **descritor é uma unidade do level**, e as unidades moram na tabela do
+  manager, em `manager + 0x7A20 + índice * 0x40`. A tabela é a mesma nos
+  dois processos (o mesmo level carregado, o mesmo gerenciador no mesmo
+  lugar da arena), e o **endereço do descritor é o mesmo nos dois** —
+  verificado em execução de verdade;
+- o caminho do spawn **não é só a ativação**: depois dela o motor ainda dá
+  ao ator o seu lugar na tabela de controladores da IA e prepara o cérebro
+  dele. Um ator criado só com a ativação fica sem o controlador e **crasha
+  o convidado** na rotina de dano do motor.
 
-**O que ainda falta saber** (para o próximo): onde moram os descritores dos
-objetos do script nos dados do level, e como o descriptor de um ator se
-liga ao par de identidade. A identidade sai do descriptor, então o
-caminho inverso existe — é ele que precisa ser achado.
+**O que foi feito:**
 
-## 5. O que está Explicitamente fora de escopo ainda
+- o host publica a ativação como um **evento** (`ActorActivated`), com a
+  identidade, a geração, o tipo, a posição, a **posição do descritor na
+  tabela de unidades** (e não o endereço, que só vale dentro de um
+  processo), o `third`, os outros argumentos e o **conteúdo** do transform
+  do spawn (ele mora na pilha de quem chamou);
+- o convidado não cria o ator — deixa o script do level dele criar, pelo
+  caminho do motor inteiro — e usa a palavra do host para dizer **qual
+  geração** aquele ator tem. As gerações do host são uma fila, porque o
+  host ativa o mesmo objeto mais de uma vez;
+- o **dano** que chega para um ator que o convidado ainda não tem **espera**
+  por ele, em vez de ser descartado. Sem isso a morte do host não cruzava:
+  o convidado recebia o dano do host milissegundos antes de o script dele
+  ativar o ator, e o dano morria no caminho.
 
-- **O corpo do parceiro** (camada 3): o convidado não vê o host de pé no
-  mapa. O mecanismo existe — o gerenciador tem 32 slots e a fase 1 usa menos
-  de dez — mas um ator livre corre o risco de o motor reagir a ele.
+**O que ainda não está resolvido:** o convidado continua nascendo ~2 s
+depois do host, porque o script do level do convidado reage aonde o
+jogador **dele** está. A replicação da ativação alinha a **identidade**
+(qual ator é qual), não o **quando**.
+
+## 6. O que está Explicitamente fora de escopo ainda
+
+- **O corpo do parceiro** (camada 3): o convidado ainda não vê o host de
+  pé no mapa. A receita está pronta (seção 4), falta a tabela de estados
+  (qual número é andar, correr, agachar, mirar, atirar) e a implementação.
 - **A vida do jogador**: hoje é local em cada processo, com o PvP desligado.
   É uma decisão, não um acidente, e está escrita em `MODE.md`.
 - **A reconexão**: se um par cai no meio da fase, a sessão acaba. É o
