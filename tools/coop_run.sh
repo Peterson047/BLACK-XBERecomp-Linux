@@ -42,6 +42,10 @@ trap cleanup EXIT
 
 echo "run dir: $RUN_DIR  duration: ${DURATION}s  port: $PORT"
 
+# The harness gives the host a shot, so the guest's body has to play the shot
+# clip and the gate can check it. A real session has no shot that nobody made.
+export BLACK_COOP_TEST_SHOT="${BLACK_COOP_TEST_SHOT:-1}"
+
 # The window is the only thing that needs a display; the game itself is happy
 # on a virtual one. Two Xvfb servers keep the instances apart.
 #

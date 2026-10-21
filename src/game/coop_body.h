@@ -33,6 +33,7 @@
 //
 // The offsets and their proofs are in `.agents/teamwork/coop/LAYOUT.md`.
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -108,12 +109,11 @@ private:
     // The partner's state, as the network has it. Null when there is no
     // partner yet.
     const net::PlayerStateData* PartnerState() const;
-    // The anim set of a character type: the one of a soldier of the level
-    // when there is one, the table's soldier otherwise.
-    uint32_t FindAnimSet() const;
-    // The unit of the level of a soldier of the level: the bone update of
-    // the animation reads the unit of the actor.
-    uint32_t FindUnit() const;
+    // A soldier of the level: the anim set the body walks with, and the
+    // unit of the level it comes from. The attach of the animation
+    // controller reads the unit with no null test, so the body waits until
+    // the level has a soldier of its own type.
+    bool FindSoldier(uint32_t* animset, uint32_t* unit) const;
     // The animation of the body: the state switch, the anim set's own
     // choice and the animation tick.
     void Animate();
@@ -135,7 +135,10 @@ private:
     uint32_t last_frame_ = 0;
     bool have_pos_ = false;
     float speed_ = 0.0f;
-    float shot_left_ = 0.0f;  // the time the shot state is still held
+    // The time the shot state is still held. The event of the shot comes
+    // from the network thread and the state is read by the engine's thread,
+    // so it is atomic.
+    std::atomic<float> shot_left_{0.0f};
     uint32_t shots_ = 0;      // the shots the body played
     uint32_t shot_serial_ = 0;
 
@@ -146,6 +149,7 @@ private:
     uint32_t heartbeat_ = 0;
     uint32_t failed_ = 0;
     uint32_t test_fire_frame_ = 0;  // the test harness's trigger
+    uint32_t test_fire_epoch_ = 0;  // the round the harness already shot in
 
     // The host: the magazine of the local player's weapon.
     uint16_t last_ammo_ = 0;

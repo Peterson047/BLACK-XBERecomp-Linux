@@ -65,11 +65,14 @@ constexpr uint32_t kActorPool = 0x79A0;       // the pool of the free actors
 constexpr uint32_t kActorLiveList = 0x79B0;   // the list of the living actors
 constexpr uint32_t kActorListArray = 0x79BC;  // the array of the living actors
 constexpr uint32_t kActorCapacity = 0x79B4;   // how many places the list has
+constexpr uint32_t kActorUsed = 0x79B8;       // how many of them are in use
 
 // the actor (LAYOUT.md §2 and §10)
 constexpr uint32_t kActorKeyA = 0x08;
 constexpr uint32_t kActorKeyB = 0x0C;
 constexpr uint32_t kActorType = 0xC4;
+constexpr uint32_t kActorGroup = 0x388;      // the group (the level) of the actor
+constexpr uint32_t kActorHealth = 0x2F0;     // float: the health of the actor
 constexpr uint32_t kActorWeapon = 0x29C;     // the weapon of the actor
 constexpr uint32_t kActorSpeed = 0x2D8;      // float: the speed, units a second
 constexpr uint32_t kActorController = 0x324; // the AI controller
@@ -108,14 +111,11 @@ constexpr uint32_t kStateAim = 13;   // the aim, the pitch in the +0x08
 
 // the type of the body: a soldier (the player of the process is 2)
 constexpr uint32_t kTypeSoldier = 1;
-// the character type of the soldier: the anim set at table+0x398
-constexpr uint32_t kSoldierCharacter = 7;
-constexpr uint32_t kAnimSetBase = 0xF8;
-constexpr uint32_t kAnimSetStride = 0x60;
 
 // the engine's own calls (LAYOUT.md section 11)
 constexpr uint32_t kPoolPop = 0x001C4A90;    // one actor out of the pool
 constexpr uint32_t kListAdd = 0x001B6770;    // one actor into the living list
+constexpr uint32_t kRelease = 0x001DA1A0;    // the actor goes back to the pool
 constexpr uint32_t kAnimAttach = 0x0017E420; // the animation controller
 constexpr uint32_t kStateSwitch = 0x0017F270;  // the record -> the clip
 constexpr uint32_t kAnimChoice = 0x0017E280;   // the anim set's own choice
@@ -157,29 +157,31 @@ bool Enabled() {
     return on;
 }
 
-// The list of the body.
-//
-// The body is not in the list of the living actors of the manager: the tick
-// of the engine asks the actor for the model and for the body of physics
-// that only an actor of the level has, and the body has none of them. The
-// list is here so that the body leaves the pool of the actors and the
-// engine does not hand it out again.
-uint32_t BodyList() {
-    static uint32_t list = 0;
-    if (!list) {
-        list = mem::AllocSystem(0x20, 16);
-        std::memset(HostPtr(list), 0, 0x20);
-        W32(list + 0x04, 1);           // one place
-        W32(list + 0x0C, list + 0x10);  // the array of the places
-    }
-    return list;
-}
-
 // The frame time of the game, in seconds.
 float FrameTime() {
     const float dt = G<float>(R32(layout::kWorld) + layout::kTimerDt);
     if (dt > 0.0f && dt < 1.0f) return dt;
     return G<float>(layout::kGameFrameTime);
+}
+
+// How many actors the manager holds as living, and the place of the body in
+// the array of that list. The count is the one the engine's walks use, and
+// the guest's count is one more than the host's: the body is one of them.
+uint32_t LiveCount(uint32_t manager) {
+    if (!manager) return 0;
+    return R32(manager + kActorUsed);
+}
+
+int LiveSlot(uint32_t manager, uint32_t actor) {
+    if (!manager || !actor) return -1;
+    const uint32_t array = R32(manager + kActorListArray);
+    if (!array) return -1;
+    uint32_t capacity = R32(manager + kActorCapacity);
+    if (capacity > 64) capacity = 64;
+    for (uint32_t i = 0; i < capacity; i++) {
+        if (R32(array + i * 4) == actor) return static_cast<int>(i);
+    }
+    return -1;
 }
 
 }  // namespace
@@ -196,11 +198,15 @@ Body& Body::Get() {
 bool Body::ApplyEvent(const net::coop::Event& event) {
     if (event.state.event_type != static_cast<uint8_t>(net::coop::EventType::Shot)) return false;
     shots_++;
-    shot_left_ = event.state.value > 0.0f ? event.state.value : kShotSeconds;
+    // The shot that arrives before the body exists is kept: the body plays
+    // it as soon as it is there (the world does the same with an activation
+    // that arrives before its actor).
+    shot_left_.store(event.state.value > 0.0f ? event.state.value : kShotSeconds,
+                     std::memory_order_relaxed);
     LOGI("%s", FormatLog("body", {{"what", "shot"},
                                   {"event", "shot"},
                                   {"seq", std::to_string(event.state.event_seq)},
-                                  {"seconds", LogNumber(shot_left_)}})
+                                  {"seconds", LogNumber(shot_left_.load(std::memory_order_relaxed))}})
                    .c_str());
     return true;
 }
@@ -261,8 +267,23 @@ bool Body::Create() {
     }
     manager_ = manager;
 
-    const uint32_t animset = FindAnimSet();
-    if (!animset || !R32(animset + kAnimSetClipTable)) {
+    // The body is made out of the level's own parts: the anim set of a
+    // soldier of the level (the way the body walks) and the unit of that
+    // soldier (the descriptor of the level, which the attach of the
+    // animation controller reads with no null test). Until the level has a
+    // soldier there is nothing to copy, and the body waits.
+    uint32_t animset = 0;
+    uint32_t unit = 0;
+    if (!FindSoldier(&animset, &unit)) {
+        if (failed_++ < 4) {
+            LOGI("%s", FormatLog("body", {{"what", "create"},
+                                          {"reason", "no_soldier"},
+                                          {"manager", std::to_string(manager)}})
+                           .c_str());
+        }
+        return false;
+    }
+    if (!R32(animset + kAnimSetClipTable)) {
         if (failed_++ < 4) {
             LOGI("%s", FormatLog("body", {{"what", "create"},
                                           {"reason", "no_anim_set"},
@@ -284,14 +305,34 @@ bool Body::Create() {
         return false;
     }
 
-    // and out of the pool, into the list of the body: the engine does not
-    // hand the actor out again. The body is not in the list of the living
-    // actors: the tick of the engine wants a model and a body of physics
-    // that only an actor of the level has, and the body drives its own
-    // animation anyway.
-    ctx.esi = BodyList();
+    // and out of the pool, into the list of the living actors of the
+    // manager: the engine's own call, the one `0x001DF340` makes. Being in
+    // that list is what makes the engine walk the body: the draw walk
+    // (`0x00180AA0`) and the lookup of the level script (`0x001B9DB0`) both
+    // walk it.
+    //
+    // The engine does not tick the body: the tick of a living actor is
+    // dispatched by the AI, and the body has no AI controller
+    // (`actor+0x324` stays zero), so the tick of the actor returns at
+    // `0x001F0DCB`, before the model of the actor is read. That is why the
+    // body needs no model of its own.
+    ctx.esi = manager + kActorLiveList;
     ctx.ebx = actor;
-    CallGuest(ctx, kListAdd, {});
+    const uint32_t added = CallGuest(ctx, kListAdd, {});
+    if (!added) {
+        // the list is full: the actor goes back to the pool and the body
+        // tries again on the next frame. The release takes the actor first
+        // and the manager second (`x86_recomp.50.cpp:13099`: `mov ebp,
+        // [esp+0x10]`, o primeiro argumento da pilha).
+        CallGuest(ctx, kRelease, {actor, manager});
+        if (failed_++ < 4) {
+            LOGI("%s", FormatLog("body", {{"what", "create"},
+                                          {"reason", "list_full"},
+                                          {"manager", std::to_string(manager)}})
+                           .c_str());
+        }
+        return false;
+    }
 
     // the identity of the level stays at 0/0: the body is not a script
     // object, so the level script never gets a handle on it and the matcher
@@ -304,6 +345,15 @@ bool Body::Create() {
     W32(actor + kActorWeapon, 0);     // no weapon: the tick goes straight to the clip
     W32(actor + kActorController, 0); // no AI: the body drives its own animation
     W32(actor + kActorRecord + kRecordState, kStateStand);
+    // The group of the actor is the level it belongs to, and the walk that
+    // takes a level away (`0x001DA2F0`) looks for the actors of that group.
+    // The body belongs to no level: the group is a value no level uses, so
+    // the body is never taken away with the level of the host.
+    W32(actor + kActorGroup, 0xFFFFFFFF);
+    // The body is a ghost: it has a life, so a stray shot does not turn it
+    // into a corpse (the routine of the death would put it in the list of
+    // the dead and would touch the flags of the mission).
+    G<float>(actor + kActorHealth) = 100.0f;
 
     // the three rows of the matrix are the axes of the actor: the identity,
     // as the activation writes them
@@ -311,12 +361,20 @@ bool Body::Create() {
     std::memcpy(HostPtr(actor + layout::coop::kActorPosition), HostPtr(0x002F4390), 16);
 
     // the unit of the level of a soldier of the level: the bone update of
-    // the animation reads it
-    W32(actor + kActorDescriptor, FindUnit());
+    // the animation reads it, and the attach of the animation controller
+    // reads it with no null test
+    W32(actor + kActorDescriptor, unit);
     W32(actor + 0x348, 0);  // the model of the detail: there is none
     W32(actor + 0x3A8, 0);  // and the flag that says there is one
-    // The flags of the physics: the body has no body of physics, and the
-    // tick of the actor would ask the physics for one that is not there.
+    // The body has no body of physics, and the flag that says so is the
+    // one the engine itself uses (`actor+0x3AF`). The anim set of the
+    // character type gives the actor a physics body (`0x0017AD70`), and
+    // with the flag on it does not: the body is a ghost and the engine
+    // never asks the physics about it.
+    W32(actor + 0x3AF, 1);
+    // The flags of the physics stay off: the body has no body of physics,
+    // and the tick of the actor would ask the physics for one that is not
+    // there.
     W32(actor + 0x3AC, 0);
     W32(actor + 0x3AD, 0);
 
@@ -371,7 +429,8 @@ bool Body::Create() {
     created_++;
     have_pos_ = false;
     speed_ = 0.0f;
-    shot_left_ = 0.0f;
+    // the time of the shot is NOT reset: a shot that arrived before the
+    // body was made is played now
     clip_.clear();
     clip_changes_ = 0;
     LOGI("%s", FormatLog("body", {{"what", "created"},
@@ -379,54 +438,47 @@ bool Body::Create() {
                                   {"anim", std::to_string(anim)},
                                   {"animset", std::to_string(animset)},
                                   {"unit", std::to_string(R32(actor + kActorDescriptor))},
+                                  {"live", std::to_string(LiveCount(manager))},
+                                  {"slot", std::to_string(LiveSlot(manager, actor))},
                                   {"threshold", LogNumber(G<float>(0x00295CE4))}})
                    .c_str());
     return true;
 }
 
-// The anim set of a character type.
+// A soldier of the level: the anim set the body walks with, and the unit of
+// the level it comes from.
 //
-// The anim set of a soldier of the level is the one of the level: the body
-// walks like the soldiers of the level walk. When there is no soldier yet
-// (the level is still coming up) the table's own soldier is used: the anim
-// set at table+0xF8+7*0x60, the one whose vtable is 0x28D0B8.
-uint32_t Body::FindAnimSet() const {
+// The two go together: the attach of the animation controller
+// (`0x0017E420`) reads the unit of the actor at `actor+0x320` and then
+// reads `+0x10`, `+0x0C` and `+0x14` of it with no null test
+// (`x86_recomp.39.cpp:23060-23076`). The unit is also where the indices of
+// the model's tables come from, so the unit and the anim set have to be of
+// the same character: they are taken from the same soldier.
+//
+// The body waits for the level to have a soldier: it is made out of the
+// level's own parts, and a soldier is the only place they come from.
+bool Body::FindSoldier(uint32_t* animset, uint32_t* unit) const {
     const uint32_t manager = R32(layout::coop::kActorManager);
-    if (manager) {
-        const uint32_t array = R32(manager + kActorListArray);
-        uint32_t capacity = R32(manager + kActorCapacity);
-        if (capacity > 64) capacity = 64;
-        for (uint32_t i = 0; i < capacity; i++) {
-            const uint32_t other = R32(array + i * 4);
-            if (!other || other == actor_) continue;
-            if (R32(other + kActorType) != kTypeSoldier) continue;
-            const uint32_t anim = R32(other + kActorAnim);
-            if (!anim) continue;
-            const uint32_t animset = R32(anim + kAnimSet);
-            if (animset) return animset;
-        }
-    }
-    const uint32_t table = R32(0x002D12C8);
-    if (!table) return 0;
-    return table + kAnimSetBase + kSoldierCharacter * kAnimSetStride;
-}
-
-// The unit of the level of a soldier of the level. The bone update of the
-// animation reads the unit of the actor, and the body has none of its own.
-uint32_t Body::FindUnit() const {
-    const uint32_t manager = R32(layout::coop::kActorManager);
-    if (!manager) return 0;
+    if (!manager) return false;
     const uint32_t array = R32(manager + kActorListArray);
+    if (!array) return false;
     uint32_t capacity = R32(manager + kActorCapacity);
     if (capacity > 64) capacity = 64;
     for (uint32_t i = 0; i < capacity; i++) {
         const uint32_t other = R32(array + i * 4);
         if (!other || other == actor_) continue;
         if (R32(other + kActorType) != kTypeSoldier) continue;
-        const uint32_t unit = R32(other + kActorDescriptor);
-        if (unit) return unit;
+        const uint32_t anim = R32(other + kActorAnim);
+        if (!anim) continue;
+        const uint32_t set = R32(anim + kAnimSet);
+        if (!set) continue;
+        const uint32_t descriptor = R32(other + kActorDescriptor);
+        if (!descriptor) continue;
+        *animset = set;
+        *unit = descriptor;
+        return true;
     }
-    return 0;
+    return false;
 }
 
 // The partner's state, as the network has it.
@@ -457,7 +509,10 @@ bool Body::Alive() const {
     if (R32(actor_) != layout::coop::kActorVtable) return false;
     if (R32(actor_ + kActorState) != 0) return false;  // alive
     if (R32(actor_ + kActorKeyA) != 0 || R32(actor_ + kActorKeyB) != 0) return false;
-    return R32(actor_ + kActorAnim) == anim_;
+    if (R32(actor_ + kActorAnim) != anim_) return false;
+    // and it is still in the list of the living actors: the engine's walks
+    // find it there
+    return LiveSlot(manager_, actor_) >= 0;
 }
 
 // The guest: the body follows the partner.
@@ -504,19 +559,34 @@ void Body::Update() {
     }
     G<float>(actor_ + kActorSpeed) = speed_;
 
+    // The body is a ghost: it keeps a life, so a stray shot does not turn
+    // it into a corpse.
+    G<float>(actor_ + kActorHealth) = 100.0f;
+
     // The flags of the physics stay off: the body has no body of physics,
-    // and the tick of the actor would ask the physics for one.
+    // and the tick of the actor would ask the physics for one. The flag
+    // that says the actor is not solid stays on too, so the anim set does
+    // not give the body a physics body.
     W32(actor_ + 0x3AC, 0);
     W32(actor_ + 0x3AD, 0);
+    W32(actor_ + 0x3AF, 1);
 
     // the record: what the body is doing. The shot is the state 7 and it is
     // held for the length of the shot; the aim is the state 13 and the pitch
-    // is in the +0x08, in degrees, the way the player writes it.
+    // is in the +0x08, in degrees, the way the player writes it; and with
+    // nothing the body stands (the state 1).
+    //
+    // The states 10 and 11 (the weapon in the hands, the weapon shouldered)
+    // are NOT used: their method asks the anim set for a clip of the weapon
+    // (`0x0017B850`), the body has no weapon, and the clip that comes back
+    // is not one the anim set of the character has - the guest dies in the
+    // advance of that clip.
     uint32_t state = kStateStand;
     if (partner->flags & kFlagAiming) state = kStateAim;
-    if (shot_left_ > 0.0f) {
+    float shot_left = shot_left_.load(std::memory_order_relaxed);
+    if (shot_left > 0.0f) {
         state = kStateShot;
-        shot_left_ = std::max(0.0f, shot_left_ - FrameTime());
+        shot_left_.store(std::max(0.0f, shot_left - FrameTime()), std::memory_order_relaxed);
     }
     W32(actor_ + kActorRecord + kRecordState, state);
     W32(actor_ + kActorRecord + kRecordP04, 0);
@@ -618,14 +688,17 @@ void Body::Animate() {
 
     // a line every second, so the log says what the body was doing while
     // it was doing nothing: the clip that did not change is the proof that
-    // the body stands still when the partner stands still.
+    // the body stands still when the partner stands still. The count of the
+    // living actors is in the line too: the body is one of them, and the
+    // guest's count is one more than the host's.
     if (++heartbeat_ >= 60) {
         heartbeat_ = 0;
         LOGI("%s", FormatLog("body", {{"what", "alive"},
                                       {"actor", std::to_string(actor_)},
                                       {"clip", clip_.empty() ? "none" : clip_},
                                       {"state", std::to_string(R32(actor_ + kActorRecord + kRecordState))},
-                                      {"speed", LogNumber(speed_)}})
+                                      {"speed", LogNumber(speed_)},
+                                      {"live", std::to_string(LiveCount(manager_))}})
                        .c_str());
     }
 }
@@ -634,34 +707,53 @@ void Body::Animate() {
 //
 // The magazine goes down when the weapon fires, and that is the only place
 // the shot is exact: the flag of the shooting of the state comes from the
-// timer of the muzzle flash and is sampled at 30 Hz, so the guest can miss
-// a shot with it.
-// The test harness: the host's own player fires, so the shot crosses and
-// the guest's body plays the shot clip. The shot is a real one - the engine
-// takes the trigger and the magazine goes down - and not a made up event.
+// timer of the muzzle flash and is sampled at 30 Hz, so the guest can miss a
+// shot with it.
+// The test harness: the trigger does not fire in a run with nobody at the
+// keyboard - the weapon stays idle and the magazine never goes down - so
+// the harness publishes the shot the way the magazine would have published
+// it. The whole chain (the event, the session, the guest, the state 7 and
+// the clip) is then the one that runs in a real match, and the gate of the
+// two instances can prove it.
 //
-// The trigger is the player's fire request (player+0x32C); the weapon takes
-// it in its own tick and spends it.
+// The harness is ON by default, because a run of the gate without it has no
+// shot at all and the body of the partner never changes its clip.
+// It is off unless the environment asks for it: a real session does not want
+// a shot that nobody made. `BLACK_COOP_TEST_SHOT=1` gives one shot per
+// round, `BLACK_COOP_TEST_SHOT=2` keeps the shot coming
+// every two seconds, which is what a soak run wants (and what the harness
+// was written for); the default is one shot per round, so a run of the gate
+// does not fill the event queue of the session.
 void Body::TestFire() {
-    static const bool on = [] {
+    static const int mode = [] {
         const char* value = std::getenv("BLACK_COOP_TEST_SHOT");
-        return value != nullptr && value[0] == '1';
+        if (value == nullptr) return 0;  // off: a real session has no shot that nobody made
+        if (value[0] == '0') return 0;
+        if (value[0] == '2') return 2;  // a shot every two seconds
+        return 1;                       // one shot per round
     }();
-    if (!on) return;
+    if (mode == 0) return;
     if (epoch_ == 0) return;
     const uint32_t player = R32(layout::kWorld) + layout::kWorldPlayer;
     if (!player) return;
     const uint32_t weapon = R32(player + kActorWeapon);
     if (!weapon) return;
-    // once every couple of seconds, and only while the round is running
-    if (++test_fire_frame_ < 120) return;
-    test_fire_frame_ = 0;
+    if (mode == 1) {
+        // one shot per round: the chain is exercised once, and the session
+        // does not carry a shot every two seconds
+        if (test_fire_epoch_ == epoch_) return;
+    } else {
+        // once every couple of seconds, and only while the round is running
+        if (++test_fire_frame_ < 120) return;
+        test_fire_frame_ = 0;
+    }
     // The trigger does not fire in a run with nobody at the keyboard: the
     // weapon stays idle and the magazine never goes down. The test harness
     // publishes the shot the way the magazine would have published it, so
     // the whole chain - the event, the session, the guest, the state 7 and
     // the clip - is the one that runs in a real match.
     PublishShot();
+    if (mode == 1) test_fire_epoch_ = epoch_;
 }
 
 void Body::PublishLocalShot() {
@@ -735,11 +827,19 @@ void Body::LogSummary() {
 // and the body does the three calls of the tail of the actor's tick itself.
 //
 // The body acts once a frame, no matter how many actors the engine ticks.
+//
+// The xmm registers are saved and put back: the calls the body makes are
+// nested inside the engine's tick of the actor, and the SDK's `CallGuest`
+// does not save them. The tick of the actor continues after this call with
+// the values it had, so the body may not change them.
 X86_EXTERN_FUNC(__imp__sub_001F0860);
 X86_FUNC(sub_001F0860) {
     // The tick of the engine comes first: it leaves the registers of the
     // guest the way the engine had them, and the anim set's methods read
     // them.
     __imp__sub_001F0860(ctx, base);
+    X86Xmm saved[8];
+    for (int i = 0; i < 8; i++) saved[i] = ctx.xmm[i];
     game::coop::Body::Get().Frame();
+    for (int i = 0; i < 8; i++) ctx.xmm[i] = saved[i];
 }
