@@ -33,6 +33,10 @@ namespace coop {
 // the state keeps.
 constexpr uint32_t kMaxObjectives = 64;
 
+// How many events of the host the mission keeps while it waits for the
+// engine's thread to apply them.
+constexpr size_t kInboxCapacity = 64;
+
 // One of the level script's named events, as the host sees it and the guest
 // fires it again.
 //
@@ -84,6 +88,19 @@ bool SameObjectives(const ObjectiveState& a, const ObjectiveState& b);
 
 // True when the level is over: every objective of the table is done.
 bool MissionFinished(const ObjectiveState& state);
+
+// What the mission does with an event that arrives from the host.
+//
+// The mission acts on the events of the level script and on the end of the
+// mission. The damage of an actor is the world layer's business: when it took
+// a place in the mission's inbox, sixty four hits were enough to push out the
+// event of a mission, and the mission stopped advancing on the guest.
+enum class EventQueueing {
+    kQueue,   // the mission acts on it
+    kIgnore,  // it is not the mission's business
+    kFull,    // the inbox is full: the event is dropped and counted
+};
+EventQueueing DecideQueueing(uint8_t event_type, size_t inbox_size, size_t capacity);
 
 // The summary line of the session, in the log's vocabulary.
 std::string SummaryLine(uint32_t epoch, uint32_t objectives, uint32_t done, uint32_t events, uint32_t unpaired,

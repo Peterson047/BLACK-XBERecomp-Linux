@@ -160,6 +160,47 @@ void TestSummaryLine() {
     }
 }
 
+// What the mission does with the events that arrive from the host.
+//
+// The damage of an actor is the world layer's business. When it took a place
+// in the mission's inbox, sixty four hits were enough to push out the event
+// of a mission, and the mission stopped advancing on the guest.
+void TestEventQueueing() {
+    using game::coop::DecideQueueing;
+    using game::coop::EventQueueing;
+    using game::coop::kInboxCapacity;
+
+    // The events of the mission are queued.
+    CHECK(DecideQueueing(static_cast<uint8_t>(net::coop::EventType::NamedEvent), 0, kInboxCapacity) ==
+          EventQueueing::kQueue);
+    CHECK(DecideQueueing(static_cast<uint8_t>(net::coop::EventType::ObjectiveChanged), 0, kInboxCapacity) ==
+          EventQueueing::kQueue);
+    CHECK(DecideQueueing(static_cast<uint8_t>(net::coop::EventType::MissionEnded), 0, kInboxCapacity) ==
+          EventQueueing::kQueue);
+    CHECK(DecideQueueing(static_cast<uint8_t>(net::coop::EventType::ObjectInteracted), 0, kInboxCapacity) ==
+          EventQueueing::kQueue);
+
+    // The damage of an actor is not the mission's business: it does not take
+    // a place in the inbox, not even when the inbox is empty.
+    CHECK(DecideQueueing(static_cast<uint8_t>(net::coop::EventType::ActorDamaged), 0, kInboxCapacity) ==
+          EventQueueing::kIgnore);
+    CHECK(DecideQueueing(static_cast<uint8_t>(net::coop::EventType::ActorDied), 0, kInboxCapacity) ==
+          EventQueueing::kIgnore);
+    CHECK(DecideQueueing(static_cast<uint8_t>(net::coop::EventType::ActorActivated), 0, kInboxCapacity) ==
+          EventQueueing::kIgnore);
+
+    // Sixty four hits do not fill the inbox, so the event of a mission that
+    // arrives after them still gets in.
+    CHECK(DecideQueueing(static_cast<uint8_t>(net::coop::EventType::ActorDamaged), 64, kInboxCapacity) ==
+          EventQueueing::kIgnore);
+    CHECK(DecideQueueing(static_cast<uint8_t>(net::coop::EventType::NamedEvent), 0, kInboxCapacity) ==
+          EventQueueing::kQueue);
+
+    // A full inbox drops the event and says so.
+    CHECK(DecideQueueing(static_cast<uint8_t>(net::coop::EventType::NamedEvent), kInboxCapacity, kInboxCapacity) ==
+          EventQueueing::kFull);
+}
+
 }  // namespace
 
 int main() {
@@ -169,6 +210,7 @@ int main() {
     TestMissionFinished();
     TestNameHash();
     TestSummaryLine();
+    TestEventQueueing();
     puts("coop mission test passed");
     return 0;
 }

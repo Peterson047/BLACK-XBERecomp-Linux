@@ -84,6 +84,22 @@ bool MissionFinished(const ObjectiveState& state) {
     return state.done >= state.count;
 }
 
+EventQueueing DecideQueueing(uint8_t event_type, size_t inbox_size, size_t capacity) {
+    switch (net::coop::EventType(event_type)) {
+        case net::coop::EventType::NamedEvent:
+        case net::coop::EventType::ObjectiveChanged:
+        case net::coop::EventType::MissionEnded:
+        case net::coop::EventType::ObjectInteracted:
+            break;
+        default:
+            // The damage of an actor, the death of an actor, the activation
+            // of an actor: the world layer's business, not the mission's.
+            return EventQueueing::kIgnore;
+    }
+    if (inbox_size >= capacity) return EventQueueing::kFull;
+    return EventQueueing::kQueue;
+}
+
 std::string SummaryLine(uint32_t epoch, uint32_t objectives, uint32_t done, uint32_t events, uint32_t unpaired,
                          uint32_t divergent) {
     char line[192];

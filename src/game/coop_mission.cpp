@@ -205,8 +205,13 @@ void Mission::OnMissionEnded() {
 }
 
 void Mission::ApplyEvent(const net::coop::Event& event) {
+    // The mission only acts on some of the events. The damage of an actor is
+    // the world layer's business, and when it took a place in this inbox,
+    // sixty four hits were enough to push out the event of a mission.
     std::lock_guard<std::mutex> lock(mutex_);
-    if (inbox_.size() >= 64) {
+    const EventQueueing decision = DecideQueueing(event.state.event_type, inbox_.size(), kInboxCapacity);
+    if (decision == EventQueueing::kIgnore) return;
+    if (decision == EventQueueing::kFull) {
         LOGE("coop: error epoch=%u what=inbox_full type=%u", epoch_, event.state.event_type);
         unpaired_++;
         return;
