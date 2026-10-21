@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "core/log.h"
+#include "game/coop_body.h"
 #include "game/layout.h"
 #include "xdk/hle.h"
 
@@ -75,7 +76,7 @@ void ReadDirection(uint32_t actor, float* direction) {
 }
 
 // the yaw and the pitch of a world direction. The convention is the one the
-// Deathmatch code already uses for the player: the yaw turns around the up
+// the game already uses for the player: the yaw turns around the up
 // axis and the pitch tilts it.
 void DirectionToAngles(const float* direction, float* yaw, float* pitch) {
     float length =
@@ -116,18 +117,18 @@ World& World::Get() {
     return instance;
 }
 
-void World::SetRole(Role role) { role_ = role; }
+void World::SetRole(Role role) { role_.store(role, std::memory_order_release); }
 
 void World::SetEpoch(uint32_t epoch) {
-    if (epoch == epoch_) return;
-    epoch_ = epoch;
+    if (epoch == epoch_.load(std::memory_order_acquire)) return;
+    epoch_.store(epoch, std::memory_order_release);
     order_.Reset(epoch);
 }
 
 void World::ResetRound(uint32_t epoch) {
-    epoch_ = epoch;
+    epoch_.store(epoch, std::memory_order_release);
     order_.Reset(epoch);
-    counters_ = WorldCounters();
+    counters_.Reset();
     std::lock_guard<std::mutex> lock(mutex_);
     pending_snapshot_ = net::coop::Snapshot();
     has_pending_snapshot_ = false;
@@ -138,6 +139,12 @@ void World::ResetRound(uint32_t epoch) {
 // The actors the manager holds. The live list is an array of pointers with a
 // fixed number of slots and the slots that are not in use are null, so they
 // are skipped; the engine walks the same array the same way.
+//
+// The body of the partner is in that list too - it has to be, or the engine
+// would not draw it - and it is not an actor of the level: it is not in the
+// snapshot of the host and it is not paired with anything. It is skipped
+// here, so the pairing of the two copies of the level does not see an actor
+// that the other side does not have.
 uint32_t World::EnumerateActors(std::vector<uint32_t>* actors) const {
     actors->clear();
     uint32_t manager = R32(layout::coop::kActorManager);
@@ -147,6 +154,7 @@ uint32_t World::EnumerateActors(std::vector<uint32_t>* actors) const {
     uint32_t capacity = R32(manager + layout::coop::kActorCapacity);
     uint32_t used = R32(manager + layout::coop::kActorCount);
     if (capacity > 64) capacity = 64;
+    const uint32_t body = Body::Get().Actor();
     for (uint32_t i = 0; i < capacity; i++) {
         uint32_t actor = R32(list + i * 4);
         if (!actor) continue;
@@ -154,6 +162,8 @@ uint32_t World::EnumerateActors(std::vector<uint32_t>* actors) const {
         // a recycled actor is out of the world: its identity is cleared and
         // the engine does not draw it
         if (R32(actor + layout::coop::kActorState) == kActorRecycled) continue;
+        // the body of the partner is not an actor of the level
+        if (body && actor == body) continue;
         actors->push_back(actor);
     }
     return used;
@@ -185,7 +195,7 @@ bool World::BuildSnapshot(net::coop::Snapshot& out) {
     std::vector<uint32_t> actors;
     uint32_t used = EnumerateActors(&actors);
     out = net::coop::Snapshot();
-    out.header.start_epoch = epoch_;
+    out.header.start_epoch = epoch_.load(std::memory_order_acquire);
     uint32_t count = 0;
     for (uint32_t actor : actors) {
         if (count >= net::coop::kMaxActorsPerSnapshot) break;
@@ -194,7 +204,7 @@ bool World::BuildSnapshot(net::coop::Snapshot& out) {
     }
     out.header.actor_count = count;
     counters_.snapshots++;
-    LOGI("%s", FormatLog("snapshot", {{"epoch", std::to_string(epoch_)},
+    LOGI("%s", FormatLog("snapshot", {{"epoch", std::to_string(epoch_.load(std::memory_order_acquire))},
                                        {"actors", std::to_string(count)},
                                        {"used", std::to_string(used)}})
                        .c_str());
@@ -206,15 +216,16 @@ bool World::ApplySnapshot(const net::coop::Snapshot& snapshot) {
         LOGE("%s", FormatLog("error", {{"reason", "not_the_guest"}, {"what", "snapshot"}}).c_str());
         return false;
     }
-    if (snapshot.header.start_epoch < epoch_) {
+    if (snapshot.header.start_epoch < epoch_.load(std::memory_order_acquire)) {
         counters_.divergent++;
         LOGI("%s", FormatLog("divergence", {{"reason", "stale_epoch"},
                                              {"epoch", std::to_string(snapshot.header.start_epoch)},
-                                             {"current", std::to_string(epoch_)}})
+                                             {"current", std::to_string(epoch_.load(std::memory_order_acquire))}})
                            .c_str());
         return false;
     }
-    if (snapshot.header.start_epoch > epoch_) SetEpoch(snapshot.header.start_epoch);
+    if (snapshot.header.start_epoch > epoch_.load(std::memory_order_acquire))
+        SetEpoch(snapshot.header.start_epoch);
 
     // the guest's actors and their identities
     std::vector<uint32_t> actors;
@@ -249,7 +260,7 @@ bool World::ApplySnapshot(const net::coop::Snapshot& snapshot) {
     }
     counters_.unpaired = unpaired;
     counters_.snapshots++;
-    LOGI("%s", FormatLog("pair", {{"epoch", std::to_string(epoch_)},
+    LOGI("%s", FormatLog("pair", {{"epoch", std::to_string(epoch_.load(std::memory_order_acquire))},
                                    {"paired", std::to_string(pairing.paired)},
                                    {"unpaired", std::to_string(unpaired)},
                                    {"missing", std::to_string(pairing.missing)}})
@@ -261,14 +272,14 @@ bool World::ApplySnapshot(const net::coop::Snapshot& snapshot) {
         last_unpaired_ = unpaired;
         LOGI("%s", FormatLog("unpaired", {{"side", "guest"},
                                           {"count", std::to_string(pairing.unpaired)},
-                                          {"epoch", std::to_string(epoch_)}})
+                                          {"epoch", std::to_string(epoch_.load(std::memory_order_acquire))}})
                            .c_str());
     }
     if (pairing.missing != last_missing_) {
         last_missing_ = pairing.missing;
         LOGI("%s", FormatLog("unpaired", {{"side", "host"},
                                           {"count", std::to_string(pairing.missing)},
-                                          {"epoch", std::to_string(epoch_)}})
+                                          {"epoch", std::to_string(epoch_.load(std::memory_order_acquire))}})
                            .c_str());
     }
     {
@@ -296,6 +307,15 @@ bool World::ApplySnapshot(const net::coop::Snapshot& snapshot) {
 // calls. The engine rebuilds its matrix and its bounding box, and the guest
 // gets the same bookkeeping the host has.
 void World::WriteActorState(uint32_t actor, const net::coop::ActorState& state) {
+    // The engine's own "set the position" writes into the actor's matrix and
+    // its box. An actor that is dead or recycled has no business getting
+    // one: the slot may already belong to another object, and the engine
+    // would write over it.
+    const uint32_t alive = R32(actor + layout::coop::kActorState);
+    if (alive != kActorAlive) {
+        counters_.skipped++;
+        return;
+    }
     X86Context& ctx = CurrentContext();
     uint32_t scratch = Scratch();
 
@@ -330,7 +350,7 @@ void World::WriteActorState(uint32_t actor, const net::coop::ActorState& state) 
         LOGI("%s", FormatLog("apply", {{"kind", "health"},
                                        {"reason", "dead_mismatch"},
                                        {"actor", std::to_string(actor)},
-                                       {"epoch", std::to_string(epoch_)}})
+                                       {"epoch", std::to_string(epoch_.load(std::memory_order_acquire))}})
                            .c_str());
     }
 }
@@ -472,7 +492,11 @@ ReplayResult World::ReplayDamage(const net::coop::Event& event, uint32_t waits) 
               {actor + layout::coop::kActorPosition, scratch + kScratchHit, Bits(damage), event_ptr,
                Bits(radius), state.damage_type, state.flags});
     g_replay_depth--;
-    if (guest_controller) {
+    // The restore only happens when the actor is still alive. The death
+    // chain releases the controller and the physics, and writing to a
+    // released controller is a write into freed memory: the host's heap
+    // comes apart a moment later, far away from here.
+    if (guest_controller && R32(actor + layout::coop::kActorState) == kActorAlive) {
         W32(guest_controller + 0x90, saved_mode);
         W32(guest_controller + 0xCA8, saved_part);
     }
@@ -523,6 +547,11 @@ uint32_t World::FindLiveActor(uint32_t key_a, uint32_t key_b) const {
 // identity and the type are already in the event, the descriptor travels as
 // its place in the manager's table of units, and the transform of the spawn
 // travels as its content, because it lives in the stack of the caller.
+void World::SetEventPublisher(EventPublisher publisher) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    publisher_ = std::move(publisher);
+}
+
 void World::PublishActivation(const ActivationCall& call) {
     if (!IsHost() || !call.actor) return;
     // The player of this process is not an object of the level: each side
@@ -537,14 +566,14 @@ void World::PublishActivation(const ActivationCall& call) {
         // It has to be visible: a silent divergence is the worst outcome.
         counters_.divergent++;
         LOGI("%s", FormatLog("divergence", {{"reason", "descriptor"},
-                                             {"epoch", std::to_string(epoch_)},
+                                             {"epoch", std::to_string(epoch_.load(std::memory_order_acquire))},
                                              {"descriptor", std::to_string(call.descriptor)},
                                              {"manager", std::to_string(manager)}})
                            .c_str());
         return;
     }
     net::coop::Event event;
-    event.state.start_epoch = epoch_;
+    event.state.start_epoch = epoch_.load(std::memory_order_acquire);
     event.state.event_type = static_cast<uint8_t>(net::coop::EventType::ActorActivated);
     event.state.native_a = call.key_a;
     event.state.native_b = call.key_b;
@@ -572,8 +601,16 @@ void World::PublishActivation(const ActivationCall& call) {
     // The event goes out now, from the engine's thread, so it keeps the
     // place of the activation in the order of the events. The damage of the
     // actor that was just activated has to come after it.
-    if (publisher_) {
-        publisher_(event);
+    // The publisher is called with a copy of it and with the lock let go:
+    // it goes to the session and to the network, and the lock of the world
+    // layer is never held while another lock is taken.
+    EventPublisher publisher;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        publisher = publisher_;
+    }
+    if (publisher) {
+        publisher(event);
         return;
     }
     std::lock_guard<std::mutex> lock(mutex_);
@@ -591,6 +628,10 @@ bool World::HostPublished(uint32_t key_a, uint32_t key_b) {
 
 void World::NoteHostPublished(uint32_t key_a, uint32_t key_b) {
     std::lock_guard<std::mutex> lock(mutex_);
+    NoteHostPublishedLocked(key_a, key_b);
+}
+
+void World::NoteHostPublishedLocked(uint32_t key_a, uint32_t key_b) {
     for (const auto& published : host_published_) {
         if (published.first == key_a && published.second == key_b) return;
     }
@@ -598,7 +639,16 @@ void World::NoteHostPublished(uint32_t key_a, uint32_t key_b) {
 }
 
 // The guest: what the host published about this object of the level.
+// The list of the activations is under the lock: the guest's own script
+// activates the objects of the level on the engine's thread and the word of
+// the host arrives on the thread that draws. The pointer is only good while
+// the lock is held, so the caller keeps it.
 World::HostActivation* World::FindHostActivation(uint32_t key_a, uint32_t key_b) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return FindHostActivationLocked(key_a, key_b);
+}
+
+World::HostActivation* World::FindHostActivationLocked(uint32_t key_a, uint32_t key_b) {
     for (HostActivation& known : host_activations_) {
         if (known.key_a == key_a && known.key_b == key_b) return &known;
     }
@@ -622,20 +672,37 @@ bool World::ApplyActivation(const net::coop::Event& event) {
     const net::coop::EventState& state = event.state;
     const net::coop::ActivationState& activation = state.activation;
 
-    // The host has an actor of this object of the level: the guest knows it
-    // now, whatever the snapshot says.
-    NoteHostPublished(state.native_a, state.native_b);
-    HostActivation* known = FindHostActivation(state.native_a, state.native_b);
-    if (!known) {
-        known = &host_activations_.emplace_back();
-        known->key_a = state.native_a;
-        known->key_b = state.native_b;
+    // The list of the activations of the host is under the lock: the guest's
+    // own script activates the objects of the level on the engine's thread
+    // and the word of the host arrives on the thread that draws. Two threads
+    // growing the same vector would corrupt the heap, and the corruption
+    // would show up far away from here.
+    uint32_t existing = 0;
+    ActivationAction action = ActivationAction::kWait;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // The host has an actor of this object of the level: the guest knows
+        // it now, whatever the snapshot says.
+        NoteHostPublishedLocked(state.native_a, state.native_b);
+        HostActivation* known = FindHostActivationLocked(state.native_a, state.native_b);
+        if (!known) {
+            known = &host_activations_.emplace_back();
+            known->key_a = state.native_a;
+            known->key_b = state.native_b;
+        }
+        // The guest's own level script was ahead of the host: it activated
+        // the object before the host's word came, and its actor takes the
+        // host's generation now, so the two sides agree on which actor is
+        // which.
+        existing = FindLiveActor(state.native_a, state.native_b);
+        action = DecideActivation(state, known->ledger, existing != 0);
+        if (action == ActivationAction::kAdopt) {
+            known->ledger.own--;
+            W32(existing + layout::coop::kActorGeneration, state.generation);
+        } else if (action == ActivationAction::kWait) {
+            known->ledger.generations.push_back(state.generation);
+        }
     }
-    // The guest's own level script was ahead of the host: it activated the
-    // object before the host's word came, and its actor takes the host's
-    // generation now, so the two sides agree on which actor is which.
-    const uint32_t existing = FindLiveActor(state.native_a, state.native_b);
-    const ActivationAction action = DecideActivation(state, known->ledger, existing != 0);
     if (action == ActivationAction::kReject) {
         // The descriptor is not a unit of the level: the guest has no way of
         // finding its own copy of it.
@@ -648,8 +715,6 @@ bool World::ApplyActivation(const net::coop::Event& event) {
         return false;
     }
     if (action == ActivationAction::kAdopt) {
-        known->ledger.own--;
-        W32(existing + layout::coop::kActorGeneration, state.generation);
         counters_.adopted++;
         LOGI("%s", FormatLog("apply", {{"kind", "activation"},
                                        {"reason", "adopted"},
@@ -663,7 +728,6 @@ bool World::ApplyActivation(const net::coop::Event& event) {
     // The guest does not have the actor yet: its own level script will
     // activate it. The host's generation is kept, and the actor the guest's
     // script makes takes it.
-    known->ledger.generations.push_back(state.generation);
     LOGI("%s", FormatLog("apply", {{"kind", "activation"},
                                    {"reason", "waiting"},
                                    {"key_a", std::to_string(state.native_a)},
@@ -687,16 +751,22 @@ bool World::ApplyActivation(const net::coop::Event& event) {
 void World::AfterGuestActivation(uint32_t actor, uint32_t key_a, uint32_t key_b) {
     if (!IsGuest() || !actor) return;
     if (key_a == 0 && key_b == 0) return;  // the player of this process
-    HostActivation* known = FindHostActivation(key_a, key_b);
-    if (!known) return;
-    // The generation of the host that goes with this actor: the queue is in
-    // the order the host made them, and the guest's script activates the
-    // objects in the same order.
+    // The list of the activations of the host is under the lock: the word of
+    // the host arrives on the thread that draws and the guest's own script
+    // takes a generation out of it on the engine's thread.
     uint32_t generation = 0;
-    if (!TakeGeneration(&known->ledger, &generation)) {
-        // The host has not activated this object yet: the guest's actor
-        // keeps the generation of the guest's own counter.
-        return;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        HostActivation* known = FindHostActivationLocked(key_a, key_b);
+        if (!known) return;
+        // The generation of the host that goes with this actor: the queue is
+        // in the order the host made them, and the guest's script activates
+        // the objects in the same order.
+        if (!TakeGeneration(&known->ledger, &generation)) {
+            // The host has not activated this object yet: the guest's actor
+            // keeps the generation of the guest's own counter.
+            return;
+        }
     }
     W32(actor + layout::coop::kActorGeneration, generation);
     counters_.adopted++;
@@ -759,9 +829,18 @@ void World::AfterActorTick(uint32_t actor) {
     // through the engine's routine, so the host publishes it and the guest
     // replays it. It is the host that kills, so it happens before the guest
     // check below.
-    if (test_kill_actor_ && actor == test_kill_actor_) {
-        const uint32_t target = test_kill_actor_;
-        test_kill_actor_ = 0;
+    // The kill of the test harness: the thread that draws arms it and the
+    // thread that runs the engine fires it, so the actor is taken under the
+    // lock and the arm is taken with it.
+    uint32_t target = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (test_kill_actor_ && actor == test_kill_actor_) {
+            target = test_kill_actor_;
+            test_kill_actor_ = 0;
+        }
+    }
+    if (target) {
         X86Context& kill_ctx = CurrentContext();
         uint32_t scratch = Scratch();
         float direction[4] = {0.0f, 0.0f, 1.0f, 0.0f};
@@ -904,10 +983,13 @@ bool World::ArmTestKill() {
     // The level spawns its actors while it comes up, so there may be none
     // yet. The caller asks again later.
     if (!best) return false;
-    test_kill_actor_ = best;
-    test_kill_key_a_ = R32(best + layout::coop::kActorKeyA);
-    test_kill_key_b_ = R32(best + layout::coop::kActorKeyB);
-    test_kill_generation_ = R32(best + layout::coop::kActorGeneration);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        test_kill_actor_ = best;
+        test_kill_key_a_ = R32(best + layout::coop::kActorKeyA);
+        test_kill_key_b_ = R32(best + layout::coop::kActorKeyB);
+        test_kill_generation_ = R32(best + layout::coop::kActorGeneration);
+    }
     LOGI("%s", FormatLog("test", {{"what", "kill"},
                                    {"reason", "armed"},
                                    {"actor", std::to_string(best)},
@@ -921,7 +1003,7 @@ bool World::ArmTestKill() {
 void World::PublishDamage(const DamageCall& call) {
     if (!IsHost() || !call.actor) return;
     net::coop::Event event;
-    event.state.start_epoch = epoch_;
+    event.state.start_epoch = epoch_.load(std::memory_order_acquire);
     event.state.event_type = static_cast<uint8_t>(net::coop::EventType::ActorDamaged);
     event.state.damage_type = static_cast<uint8_t>(call.type);
     event.state.native_a = call.native_a;
@@ -943,8 +1025,16 @@ void World::PublishDamage(const DamageCall& call) {
                                    {"radius", LogNumber(call.radius)},
                                    {"type", std::to_string(call.type)}})
                        .c_str());
-    if (publisher_) {
-        publisher_(event);
+    // The publisher is called with a copy of it and with the lock let go:
+    // it goes to the session and to the network, and the lock of the world
+    // layer is never held while another lock is taken.
+    EventPublisher publisher;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        publisher = publisher_;
+    }
+    if (publisher) {
+        publisher(event);
         return;
     }
     std::lock_guard<std::mutex> lock(mutex_);
@@ -959,7 +1049,7 @@ std::vector<net::coop::Event> World::TakePendingEvents() {
 }
 
 void World::LogSummary() {
-    LOGI("%s", FormatLog("summary", {{"epoch", std::to_string(epoch_)},
+    LOGI("%s", FormatLog("summary", {{"epoch", std::to_string(epoch_.load(std::memory_order_acquire))},
                                       {"snapshots", std::to_string(counters_.snapshots)},
                                       {"events", std::to_string(counters_.events)},
                                       {"unpaired", std::to_string(counters_.unpaired)},

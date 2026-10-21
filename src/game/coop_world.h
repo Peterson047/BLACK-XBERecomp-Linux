@@ -35,6 +35,7 @@
 //   // the end of the session
 //   world.LogSummary();
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -47,7 +48,7 @@
 namespace game {
 namespace coop {
 
-// Which side of the co-op this process is. The Deathmatch path is offline.
+// Which side of the co-op this process is. Offline is the state before the session starts.
 enum class Role : uint8_t {
     kOffline = 0,
     kHost = 1,
@@ -109,9 +110,9 @@ public:
     // The session layer tells the world layer which side it is. The host
     // publishes, the guest reacts, and the offline process does neither.
     void SetRole(Role role);
-    Role GetRole() const { return role_; }
-    bool IsHost() const { return role_ == Role::kHost; }
-    bool IsGuest() const { return role_ == Role::kGuest; }
+    Role GetRole() const { return role_.load(std::memory_order_acquire); }
+    bool IsHost() const { return GetRole() == Role::kHost; }
+    bool IsGuest() const { return GetRole() == Role::kGuest; }
 
     // The round. Everything that crosses the network carries it, and a
     // packet of an older round is dropped.
@@ -147,8 +148,14 @@ public:
 
     // The host: the events the world layer produced. The session layer takes
     // them, gives them their sequence number and sends them.
+    //
+    // The publisher is called from the thread that runs the engine and it is
+    // set from the thread that draws, so it is under the lock. The call
+    // itself is made with a copy and with the lock let go: the publisher
+    // goes to the session and to the network, and the lock of the world
+    // layer is never held while another lock is taken.
     using EventPublisher = std::function<void(const net::coop::Event&)>;
-    void SetEventPublisher(EventPublisher publisher) { publisher_ = std::move(publisher); }
+    void SetEventPublisher(EventPublisher publisher);
     std::vector<net::coop::Event> TakePendingEvents();
 
     // The host: the engine activated an actor.
@@ -188,8 +195,8 @@ public:
     };
 
     // What the world layer counted during the round.
-    uint32_t UnpairedCount() const { return counters_.unpaired; }
-    uint32_t DivergentCount() const { return counters_.divergent; }
+    uint32_t UnpairedCount() const { return counters_.unpaired.load(std::memory_order_acquire); }
+    uint32_t DivergentCount() const { return counters_.divergent.load(std::memory_order_acquire); }
 
     // The end of the session: one summary line, so a test can read the
     // round without reading the whole log.
@@ -225,21 +232,34 @@ private:
     // The guest: the living actor with this identity, or zero.
     uint32_t FindLiveActor(uint32_t key_a, uint32_t key_b) const;
     // The guest: what the host published about this object of the level.
+    // The pointer is only good while the lock is held: the caller keeps it.
     HostActivation* FindHostActivation(uint32_t key_a, uint32_t key_b);
+    // The same, with the lock already held.
+    HostActivation* FindHostActivationLocked(uint32_t key_a, uint32_t key_b);
     // The guest: did the host say it has an actor of this object of the
     // level? The snapshot that carries the actor can be late; the word of
     // the activation cannot.
     bool HostPublished(uint32_t key_a, uint32_t key_b);
     void NoteHostPublished(uint32_t key_a, uint32_t key_b);
+    // The same, with the lock already held.
+    void NoteHostPublishedLocked(uint32_t key_a, uint32_t key_b);
 
-    Role role_ = Role::kOffline;
-    uint32_t epoch_ = 0;
+    // The role and the round are written by the thread that draws and read
+    // by the thread that runs the engine: they are atomic.
+    std::atomic<Role> role_{Role::kOffline};
+    std::atomic<uint32_t> epoch_{0};
     WorldCounters counters_;
     EventOrder order_;
 
+    // The lock of the state that the thread that runs the engine and the
+    // thread that draws both touch. It is never held while the code calls
+    // out - into the guest, into the session or into the network - because
+    // those take locks of their own and the orders would cross.
     std::mutex mutex_;
     uint32_t last_unpaired_ = 0;  // what the last pairing said, to log the change
     uint32_t last_missing_ = 0;
+    // The kill of the test harness: the thread that draws arms it and the
+    // thread that runs the engine fires it.
     uint32_t test_kill_actor_ = 0;   // the actor the test harness is going to kill
     uint32_t test_kill_key_a_ = 0;
     uint32_t test_kill_key_b_ = 0;
@@ -258,7 +278,9 @@ private:
     uint32_t last_event_frame_ = 0;
     std::vector<net::coop::Event> outgoing_events_;
     // The activations the host published and the guest has not seen the
-    // actor of yet.
+    // actor of yet. The guest's own script activates the objects of the
+    // level on the engine's thread and the host's word arrives on the
+    // thread that draws, so the list is under the lock.
     std::vector<HostActivation> host_activations_;
     // The objects of the level the host said it activated. The snapshot
     // that carries the actor can be late; this cannot.

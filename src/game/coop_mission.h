@@ -18,6 +18,7 @@
 // tested without the game. The game part (the hooks, the reads of the world,
 // the log) is in coop_mission.cpp.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
@@ -135,14 +136,18 @@ public:
     static Mission& Get();
 
     // Which side this process is. The host decides; the guest reacts.
+    // The thread that draws sets it and the thread that runs the engine reads
+    // it, so it is atomic.
     void SetHost(bool host);
-    bool IsHost() const { return host_; }
+    bool IsHost() const { return host_.load(std::memory_order_acquire); }
 
     // The round. Everything that crosses the wire carries it. The guest stops
     // letting its own events happen once the round is known: the host's world
     // is the authority.
-    void SetEpoch(uint32_t epoch) { epoch_ = epoch; }
-    uint32_t Epoch() const { return epoch_; }
+    // The round is written by the thread that draws and read by the thread
+    // that runs the engine, so it is atomic.
+    void SetEpoch(uint32_t epoch) { epoch_.store(epoch, std::memory_order_release); }
+    uint32_t Epoch() const { return epoch_.load(std::memory_order_acquire); }
 
     // A new round: the counters start again and nothing of the last one is
     // left waiting.
@@ -187,7 +192,7 @@ public:
     // Watches the state of the objectives and the end of the mission, once a
     // frame. It reads the table of the objectives, which is the engine's
     // memory, so it runs on the thread that draws, the same way the
-    // Deathmatch reads the engine's memory. The state it keeps is under the
+    // The engine's memory is read from more than one thread. The state it keeps is under the
     // lock, because the thread that runs the engine writes part of it.
     void Pump();
 
@@ -200,25 +205,13 @@ public:
     // The counters of the session. They are read by the thread that draws,
     // while the thread that runs the engine writes them, so they are read
     // under the lock.
-    uint32_t Events() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return events_;
-    }
-    uint32_t Unpaired() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return unpaired_;
-    }
-    uint32_t Divergent() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return divergent_;
-    }
+    uint32_t Events() const { return events_.load(std::memory_order_acquire); }
+    uint32_t Unpaired() const { return unpaired_.load(std::memory_order_acquire); }
+    uint32_t Divergent() const { return divergent_.load(std::memory_order_acquire); }
 
     // The mission is over: every objective of the table is done, or the host
     // said so. The round ends on both sides.
-    bool Ended() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return ended_;
-    }
+    bool Ended() const { return ended_.load(std::memory_order_acquire); }
 
     // The summary of the session, at the end of it.
     void LogSummary() const;
@@ -244,12 +237,14 @@ private:
     // divergence is only counted and logged once.
     void NoteDivergence(uint32_t host_count, uint32_t host_done, const ObjectiveState& local);
 
-    bool host_ = true;
-    uint32_t epoch_ = 0;
+    std::atomic<bool> host_{true};
+    std::atomic<uint32_t> epoch_{0};
 
-    uint32_t events_ = 0;     // the events the host published or the guest applied
-    uint32_t unpaired_ = 0;   // the events the host had and the guest did not
-    uint32_t divergent_ = 0;  // the divergences found
+    // The counters are counted by the thread that runs the engine and read by
+    // the thread that draws, so they are atomic.
+    std::atomic<uint32_t> events_{0};     // the events the host published or the guest applied
+    std::atomic<uint32_t> unpaired_{0};   // the events the host had and the guest did not
+    std::atomic<uint32_t> divergent_{0};  // the divergences found
 
     bool has_remote_ = false;
     uint32_t remote_count_ = 0;
@@ -259,8 +254,10 @@ private:
     uint32_t bus_ = 0;        // the bus of this process
     uint8_t kind_ = 0;        // the kind of the event being fired
     bool has_kind_ = false;
-    bool ended_ = false;      // the mission was already announced as over
-    bool summary_ = false;    // the summary of the session was already printed
+    // The end of the mission and the summary are written by the thread that
+    // runs the engine and by the thread that draws, so they are atomic.
+    std::atomic<bool> ended_{false};    // the mission was already announced as over
+    std::atomic<bool> summary_{false};  // the summary of the session was already printed
     bool divergence_logged_ = false;  // the last divergence was already logged
     uint32_t divergence_count_ = 0;   // the state of the host in that divergence
     uint32_t divergence_done_ = 0;
@@ -278,8 +275,8 @@ private:
     // The guest's memory that the replayed events needed, and that went back
     // to the guest's heap. The two numbers have to be the same: a difference
     // is a leak of the guest's address space.
-    uint32_t scratch_allocs_ = 0;
-    uint32_t scratch_frees_ = 0;
+    std::atomic<uint32_t> scratch_allocs_{0};
+    std::atomic<uint32_t> scratch_frees_{0};
 
     // The lock of the state that two threads touch: the thread that runs the
     // engine (which fires the events of the level script) and the thread that

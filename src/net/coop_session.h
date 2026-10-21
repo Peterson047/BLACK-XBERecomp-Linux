@@ -11,6 +11,7 @@
 //
 // The design is in .agents/teamwork/coop/PROTOCOL.md.
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -41,10 +42,10 @@ public:
     explicit CoopSession(NetworkManager& network);
     ~CoopSession() override;
 
-    // The session does nothing until it is enabled, so the Deathmatch path is
+    // The session does nothing until it is enabled, so the path before it is
     // untouched when the co-op is off.
     void SetEnabled(bool enabled);
-    bool IsEnabled() const { return enabled_; }
+    bool IsEnabled() const { return enabled_.load(std::memory_order_acquire); }
 
     // The tick. The host publishes the room and the snapshot and resends what
     // was not acknowledged; the guest answers and applies what arrived.
@@ -79,8 +80,8 @@ public:
     // The host: the mission is over and the round ends.
     void EndRound();
 
-    coop::Phase GetPhase() const { return phase_; }
-    uint32_t GetStartEpoch() const { return start_epoch_; }
+    coop::Phase GetPhase() const { return phase_.load(std::memory_order_acquire); }
+    uint32_t GetStartEpoch() const { return start_epoch_.load(std::memory_order_acquire); }
     // The room as the guest last saw it.
     const coop::Room& GetRoom() const { return room_; }
 
@@ -146,11 +147,15 @@ private:
 
     NetworkManager& network_;
 
-    bool enabled_ = false;
-    coop::Phase phase_ = coop::Phase::Idle;
+    // The state of the session is read by the thread that publishes the
+    // events of the world (the thread that runs the engine) and written by
+    // the thread that runs the session (the thread that draws), so the three
+    // that both of them touch are atomic.
+    std::atomic<bool> enabled_{false};
+    std::atomic<coop::Phase> phase_{coop::Phase::Idle};
     uint32_t session_id_ = 0;
     uint32_t revision_ = 0;
-    uint32_t start_epoch_ = 0;
+    std::atomic<uint32_t> start_epoch_{0};
     uint8_t mission_id_ = 0;
 
     // The host's view of the room.

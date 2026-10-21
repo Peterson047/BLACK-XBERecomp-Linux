@@ -28,12 +28,12 @@ CoopSession::~CoopSession() {
 }
 
 void CoopSession::SetEnabled(bool enabled) {
-    enabled_ = enabled;
+    enabled_.store(enabled, std::memory_order_release);
     if (enabled) {
         session_id_ = NowMs();
         revision_ = 0;
-        start_epoch_ = 0;
-        phase_ = coop::Phase::Lobby;
+        start_epoch_.store(0, std::memory_order_release);
+        phase_.store(coop::Phase::Lobby, std::memory_order_release);
         present_mask_ = 0;
         ready_mask_ = 0;
         loaded_mask_ = 0;
@@ -57,18 +57,18 @@ void CoopSession::SetEnabled(bool enabled) {
         }
     } else {
         network_.SetCoopHandler(nullptr);
-        phase_ = coop::Phase::Idle;
+        phase_.store(coop::Phase::Idle, std::memory_order_release);
     }
 }
 
 void CoopSession::Update(float dt) {
-    if (!enabled_) return;
+    if (!enabled_.load(std::memory_order_acquire)) return;
 
     if (IsHost()) {
         // A peer that is loading the level is not silent because it is
         // broken, it is silent because it is reading a level. The timeout
         // has to follow the phase.
-        network_.SetPeerTimeout(phase_ == coop::Phase::Loading ? loading_timeout_ : lobby_timeout_);
+        network_.SetPeerTimeout(phase_.load(std::memory_order_acquire) == coop::Phase::Loading ? loading_timeout_ : lobby_timeout_);
 
         // The room goes out again now and then, so a guest that joined late
         // still learns which mission the host named.
@@ -92,16 +92,16 @@ void CoopSession::Update(float dt) {
             if (pending) ResendUnacked();
         }
     } else if (IsGuest()) {
-        network_.SetPeerTimeout(phase_ == coop::Phase::Loading ? loading_timeout_ : lobby_timeout_);
+        network_.SetPeerTimeout(phase_.load(std::memory_order_acquire) == coop::Phase::Loading ? loading_timeout_ : lobby_timeout_);
     }
 }
 
 void CoopSession::PublishSnapshot(const coop::Snapshot& snapshot) {
-    if (!enabled_ || !IsHost()) return;
+    if (!enabled_.load(std::memory_order_acquire) || !IsHost()) return;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         pending_snapshot_ = snapshot;
-        pending_snapshot_.header.start_epoch = start_epoch_;
+        pending_snapshot_.header.start_epoch = start_epoch_.load(std::memory_order_acquire);
         has_snapshot_ = true;
     }
     // The snapshot goes out now. The world layer built it because the world
@@ -113,8 +113,8 @@ void CoopSession::PublishSnapshot(const coop::Snapshot& snapshot) {
 }
 
 void CoopSession::PublishEvent(const coop::Event& event) {
-    if (!enabled_ || !IsHost()) return;
-    if (phase_ != coop::Phase::InMission) {
+    if (!enabled_.load(std::memory_order_acquire) || !IsHost()) return;
+    if (phase_.load(std::memory_order_acquire) != coop::Phase::InMission) {
         // An event outside a round has no place: the round counts the
         // events from one, and the guest would count an event that the host
         // does not count, because the guest counts the events it applied
@@ -123,7 +123,7 @@ void CoopSession::PublishEvent(const coop::Event& event) {
         return;
     }
     coop::Event outgoing = event;
-    outgoing.state.start_epoch = start_epoch_;
+    outgoing.state.start_epoch = start_epoch_.load(std::memory_order_acquire);
     {
         // The events come from two threads: the damage of an actor is
         // published from the engine's thread, inside the damage routine, and
@@ -153,15 +153,15 @@ void CoopSession::SetTimeouts(float lobby_seconds, float loading_seconds) {
 }
 
 void CoopSession::HostStartMission(uint8_t mission_id) {
-    if (!enabled_ || !IsHost()) return;
+    if (!enabled_.load(std::memory_order_acquire) || !IsHost()) return;
     mission_id_ = mission_id;
-    phase_ = coop::Phase::Loading;
+    phase_.store(coop::Phase::Loading, std::memory_order_release);
     PublishRoom();
-    LOGI("coop: mission epoch=%u mission=%u", start_epoch_, mission_id_);
+    LOGI("coop: mission epoch=%u mission=%u", start_epoch_.load(std::memory_order_acquire), mission_id_);
 }
 
 void CoopSession::SetLoaded(bool loaded) {
-    if (!enabled_) return;
+    if (!enabled_.load(std::memory_order_acquire)) return;
     loaded_ = loaded;
     if (IsGuest()) {
         SendReady();
@@ -176,7 +176,7 @@ void CoopSession::SetLoaded(bool loaded) {
 }
 
 void CoopSession::SetReady(bool ready) {
-    if (!enabled_) return;
+    if (!enabled_.load(std::memory_order_acquire)) return;
     ready_ = ready;
     if (IsGuest()) {
         SendReady();
@@ -197,16 +197,16 @@ void CoopSession::SetReady(bool ready) {
 
 // The mission is over: the round ends on both sides.
 void CoopSession::EndRound() {
-    if (!enabled_ || !IsHost()) return;
-    if (phase_ == coop::Phase::Ended) return;
-    phase_ = coop::Phase::Ended;
+    if (!enabled_.load(std::memory_order_acquire) || !IsHost()) return;
+    if (phase_.load(std::memory_order_acquire) == coop::Phase::Ended) return;
+    phase_.store(coop::Phase::Ended, std::memory_order_release);
     PublishRoom();
-    LOGI("coop: round epoch=%u ended", start_epoch_);
+    LOGI("coop: round epoch=%u ended", start_epoch_.load(std::memory_order_acquire));
 }
 
 void CoopSession::TryStartRound() {
-    if (!enabled_ || !IsHost()) return;
-    if (phase_ != coop::Phase::Loading) return;
+    if (!enabled_.load(std::memory_order_acquire) || !IsHost()) return;
+    if (phase_.load(std::memory_order_acquire) != coop::Phase::Loading) return;
     present_mask_ = network_.GetPresentMask();
     if (present_mask_ == 0) return;
     // Every peer that is present has to have loaded before the round starts.
@@ -215,13 +215,13 @@ void CoopSession::TryStartRound() {
 }
 
 void CoopSession::PublishRoom() {
-    if (!enabled_ || !IsHost()) return;
+    if (!enabled_.load(std::memory_order_acquire) || !IsHost()) return;
     present_mask_ = network_.GetPresentMask();
     coop::Room room{};
     room.state.session_id = session_id_;
-    room.state.start_epoch = start_epoch_;
+    room.state.start_epoch = start_epoch_.load(std::memory_order_acquire);
     room.state.mission_id = mission_id_;
-    room.state.phase = static_cast<uint8_t>(phase_);
+    room.state.phase = static_cast<uint8_t>(phase_.load(std::memory_order_acquire));
     room.state.present_mask = present_mask_;
     room.state.ready_mask = ready_mask_;
     room.state.loaded_mask = loaded_mask_;
@@ -248,7 +248,7 @@ void CoopSession::PublishRoom() {
 }
 
 void CoopSession::SendReady() {
-    if (!enabled_ || !IsGuest()) return;
+    if (!enabled_.load(std::memory_order_acquire) || !IsGuest()) return;
     coop::Ready ready{};
     ready.state.start_epoch = room_.state.start_epoch;
     ready.state.ready = ready_ ? 1 : 0;
@@ -268,9 +268,9 @@ void CoopSession::SendReady() {
 }
 
 void CoopSession::SendSnapshot() {
-    if (!enabled_ || !IsHost() || !has_snapshot_) return;
+    if (!enabled_.load(std::memory_order_acquire) || !IsHost() || !has_snapshot_) return;
     coop::Snapshot snapshot = pending_snapshot_;
-    snapshot.header.start_epoch = start_epoch_;
+    snapshot.header.start_epoch = start_epoch_.load(std::memory_order_acquire);
     snapshot.header.part_index = 0;
     snapshot.header.part_count = 1;
 
@@ -289,7 +289,7 @@ void CoopSession::SendSnapshot() {
 }
 
 void CoopSession::SendEvent(const coop::Event& event) {
-    if (!enabled_ || !IsHost()) return;
+    if (!enabled_.load(std::memory_order_acquire) || !IsHost()) return;
     uint8_t buffer[sizeof(PacketHeader) + sizeof(coop::EventState)];
     PacketHeader header{};
     header.magic = kProtocolMagic;
@@ -320,15 +320,15 @@ void CoopSession::ResendUnacked() {
 }
 
 void CoopSession::StartRound() {
-    start_epoch_++;
-    phase_ = coop::Phase::InMission;
+    start_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    phase_.store(coop::Phase::InMission, std::memory_order_release);
     next_event_seq_ = 0;
     last_applied_seq_ = 0;
     unacked_.clear();
     pending_events_.clear();
     PublishRoom();
-    if (round_handler_) round_handler_(start_epoch_, true);
-    LOGI("coop: round epoch=%u started", start_epoch_);
+    if (round_handler_) round_handler_(start_epoch_.load(std::memory_order_acquire), true);
+    LOGI("coop: round epoch=%u started", start_epoch_.load(std::memory_order_acquire));
 }
 
 void CoopSession::ApplyEvent(const coop::Event& event) {
@@ -349,41 +349,41 @@ void CoopSession::DrainPending() {
 }
 
 void CoopSession::OnCoopRoom(const uint8_t* data, size_t size) {
-    if (!enabled_) return;
+    if (!enabled_.load(std::memory_order_acquire)) return;
     coop::Room room{};
     if (!coop::DecodeRoom(data, size, &room)) return;
     // A room that is not newer than the one we have is not news. The same
     // room sent twice is applied twice, and that is harmless.
     if (room.state.revision <= room_revision_ && room.state.session_id == room_.state.session_id) return;
 
-    const bool was_loading = phase_ == coop::Phase::Loading;
+    const bool was_loading = phase_.load(std::memory_order_acquire) == coop::Phase::Loading;
     room_ = room;
     room_revision_ = room.state.revision;
-    phase_ = static_cast<coop::Phase>(room.state.phase);
+    phase_.store(static_cast<coop::Phase>(room.state.phase), std::memory_order_release);
     mission_id_ = room.state.mission_id;
 
     LOGI("coop: room revision=%u epoch=%u phase=%u", room.state.revision, room.state.start_epoch,
          room.state.phase);
 
-    if (phase_ == coop::Phase::Loading && !was_loading) {
+    if (phase_.load(std::memory_order_acquire) == coop::Phase::Loading && !was_loading) {
         // The host named the mission: tell it we are on it.
         SendReady();
     }
-    if (phase_ == coop::Phase::InMission && room.state.start_epoch != start_epoch_) {
-        start_epoch_ = room.state.start_epoch;
+    if (phase_.load(std::memory_order_acquire) == coop::Phase::InMission && room.state.start_epoch != start_epoch_.load(std::memory_order_acquire)) {
+        start_epoch_.store(room.state.start_epoch, std::memory_order_release);
         last_applied_seq_ = 0;
         pending_events_.clear();
-        if (round_handler_) round_handler_(start_epoch_, true);
-        LOGI("coop: round epoch=%u started", start_epoch_);
+        if (round_handler_) round_handler_(start_epoch_.load(std::memory_order_acquire), true);
+        LOGI("coop: round epoch=%u started", start_epoch_.load(std::memory_order_acquire));
     }
 }
 
 void CoopSession::OnCoopReady(uint8_t player_id, const uint8_t* data, size_t size) {
-    if (!enabled_ || !IsHost()) return;
+    if (!enabled_.load(std::memory_order_acquire) || !IsHost()) return;
     if (player_id == 0 || player_id >= kMaxPlayers) return;
     coop::Ready ready{};
     if (!coop::DecodeReady(data, size, &ready)) return;
-    if (ready.state.start_epoch != start_epoch_) {
+    if (ready.state.start_epoch != start_epoch_.load(std::memory_order_acquire)) {
         // The guest is answering about another round.
         stale_count_++;
         return;
@@ -395,10 +395,10 @@ void CoopSession::OnCoopReady(uint8_t player_id, const uint8_t* data, size_t siz
 }
 
 void CoopSession::OnCoopSnapshot(const uint8_t* data, size_t size) {
-    if (!enabled_) return;
+    if (!enabled_.load(std::memory_order_acquire)) return;
     coop::Snapshot snapshot{};
     if (!coop::DecodeSnapshot(data, size, &snapshot)) return;
-    if (snapshot.header.start_epoch != start_epoch_) {
+    if (snapshot.header.start_epoch != start_epoch_.load(std::memory_order_acquire)) {
         stale_count_++;
         return;
     }
@@ -407,10 +407,10 @@ void CoopSession::OnCoopSnapshot(const uint8_t* data, size_t size) {
 }
 
 void CoopSession::OnCoopEvent(const uint8_t* data, size_t size) {
-    if (!enabled_) return;
+    if (!enabled_.load(std::memory_order_acquire)) return;
     coop::Event event{};
     if (!coop::DecodeEvent(data, size, &event)) return;
-    if (event.state.start_epoch != start_epoch_) {
+    if (event.state.start_epoch != start_epoch_.load(std::memory_order_acquire)) {
         // An event from another round belongs to a mission that is over.
         stale_count_++;
         return;
@@ -439,8 +439,8 @@ void CoopSession::OnCoopEvent(const uint8_t* data, size_t size) {
 
     // The mission is over: the round ends on the guest too.
     if (event.state.event_type == static_cast<uint8_t>(coop::EventType::MissionEnded)) {
-        phase_ = coop::Phase::Ended;
-        LOGI("coop: round epoch=%u ended", start_epoch_);
+        phase_.store(coop::Phase::Ended, std::memory_order_release);
+        LOGI("coop: round epoch=%u ended", start_epoch_.load(std::memory_order_acquire));
     }
 
     // Tell the host how far we got, so it can stop sending.
@@ -452,7 +452,7 @@ void CoopSession::OnCoopEvent(const uint8_t* data, size_t size) {
 // guest can send it again without harm.
 void CoopSession::SendAck() {
     coop::AckState ack{};
-    ack.start_epoch = start_epoch_;
+    ack.start_epoch = start_epoch_.load(std::memory_order_acquire);
     ack.event_seq = last_applied_seq_;
     uint8_t buffer[sizeof(PacketHeader) + sizeof(coop::AckState)];
     PacketHeader header{};
@@ -469,10 +469,10 @@ void CoopSession::SendAck() {
 }
 
 void CoopSession::OnCoopAck(uint8_t player_id, const uint8_t* data, size_t size) {
-    if (!enabled_ || !IsHost()) return;
+    if (!enabled_.load(std::memory_order_acquire) || !IsHost()) return;
     coop::AckState ack{};
     if (!coop::DecodeAck(data, size, &ack)) return;
-    if (ack.start_epoch != start_epoch_) {
+    if (ack.start_epoch != start_epoch_.load(std::memory_order_acquire)) {
         stale_count_++;
         return;
     }

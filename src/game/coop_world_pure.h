@@ -11,6 +11,7 @@
 // The protocol these decisions serve is in .agents/teamwork/coop/PROTOCOL.md;
 // the engine offsets they are about are in game/layout.h.
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -201,14 +202,30 @@ private:
 };
 
 // What the world layer counted during the round.
+//
+// Two threads count: the thread that runs the engine counts the events it
+// publishes and the damages it replays, and the thread that draws counts
+// the snapshots and the pairings. The counters are atomic, so a count is
+// never lost between them and neither of them ever reads a torn one.
 struct WorldCounters {
-    uint32_t snapshots = 0;  // the snapshots the host published
-    uint32_t events = 0;     // the events the host published
-    uint32_t unpaired = 0;   // the guest actors that matched nothing
-    uint32_t divergent = 0;  // the events that arrived out of order or stale
-    uint32_t skipped = 0;    // the damages that were not applied
-    uint32_t applied = 0;    // the damages that were replayed
-    uint32_t adopted = 0;    // the activations the guest took the host's generation of
+    std::atomic<uint32_t> snapshots{0};  // the snapshots the host published
+    std::atomic<uint32_t> events{0};     // the events the host published
+    std::atomic<uint32_t> unpaired{0};   // the guest actors that matched nothing
+    std::atomic<uint32_t> divergent{0};  // the events that arrived out of order or stale
+    std::atomic<uint32_t> skipped{0};    // the damages that were not applied
+    std::atomic<uint32_t> applied{0};    // the damages that were replayed
+    std::atomic<uint32_t> adopted{0};    // the activations the guest took the host's generation of
+
+    // A new round: the counters start again.
+    void Reset() {
+        snapshots = 0;
+        events = 0;
+        unpaired = 0;
+        divergent = 0;
+        skipped = 0;
+        applied = 0;
+        adopted = 0;
+    }
 };
 
 // The activation of an actor.

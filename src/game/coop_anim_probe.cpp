@@ -22,6 +22,7 @@
 
 #include "game/coop_anim_probe.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -80,8 +81,11 @@ std::unordered_map<uint32_t, Seen> g_seen;
 // `0x0017F270` takes the record in eax and the controller in ecx, and the
 // arm the state takes starts a clip: the clip that starts inside the
 // switch is the one the state chose.
-uint32_t g_record = 0;
-bool g_switching = false;
+// The record the state switch is reading, and the switch itself. The hooks
+// of the probe run on the thread that runs the engine, and the engine has
+// more than one thread, so the two are atomic.
+std::atomic<uint32_t> g_record{0};
+std::atomic<bool> g_switching{false};
 
 // The probe is off unless the environment asks for it
 bool EnvOn(const char* name) {
@@ -214,18 +218,18 @@ void Chosen(uint32_t actor, uint32_t record, const std::string& clip, uint32_t f
 // arm the state takes starts a clip: the clip that starts inside the
 // switch is the one the state chose.
 void BeginSwitch(uint32_t record) {
-    g_record = record;
-    g_switching = true;
+    g_record.store(record, std::memory_order_release);
+    g_switching.store(true, std::memory_order_release);
 }
 
 void EndSwitch() {
-    g_switching = false;
-    g_record = 0;
+    g_switching.store(false, std::memory_order_release);
+    g_record.store(0, std::memory_order_release);
 }
 
-uint32_t Record() { return g_record; }
+uint32_t Record() { return g_record.load(std::memory_order_acquire); }
 
-bool Switching() { return g_switching; }
+bool Switching() { return g_switching.load(std::memory_order_acquire); }
 
 }  // namespace coop_anim
 }  // namespace game
