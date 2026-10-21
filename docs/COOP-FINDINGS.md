@@ -111,11 +111,71 @@ depois do host, porque o script do level do convidado reage aonde o
 jogador **dele** está. A replicação da ativação alinha a **identidade**
 (qual ator é qual), não o **quando**.
 
+## 5. A animação de osso: por que o corpo desliza congelado
+
+As duas chamadas que o mundo já faz para colocar um ator no lugar —
+`sub_001CE600` (a direção) e `sub_001CE660` (a posição) — **não tocam a
+animação**. Não escrevem o registro de estado, não escolhem o clip, não
+chamam o tick da animação. O corpo desliza pelo chão com a pose congelada:
+é o que se vê quando os jogadores aparecem sem a animação de osso.
+
+A animação de um personagem é:
+
+```
+ator
+ ├─ +0x328   o controlador de animação (outro objeto)
+ ├─ +0x32C   o registro de estado (5 campos)   <- o que a rede escreve
+ ├─ +0x324   o controlador de IA (outro objeto) <- tem que não ser nulo
+ └─ +0x278   o corpo de movimento
+```
+
+**A decisão é do lado da IA, a execução é do lado da animação.** O número
+do estado escolhe o tipo de locomoção, o conjunto de animação do tipo de
+personagem escolhe o clip, e o controlador de animação só toca: faz a
+transição, avança e escreve os onze ossos. Então quem escreve `actor+0x32C`
+decide a pose — é aí que a rede entra.
+
+A tabela foi **medida no jogo de verdade**
+(`.agents/teamwork/coop/anim/STATE_TABLE.md`):
+
+| o quê | o estado | o clip |
+|---|---|---|
+| a pose de pé | 1 | `SH_AR_S_540/541/560` e companhia |
+| a mira | 13 (`0x0D`) | `SH_AR_S_150/151/160/161`, `SH_AR_C_160/161` |
+| a arma pronta / no ombro | 10 e 11 | `SH_AR_U_101`, `SH_AR_U_SHO` |
+| o disparo | 7 | o estado que a arma escreve |
+
+**O registro não carrega a velocidade.** Os quatro parâmetros ficaram
+constantes enquanto o personagem andava; o que muda é o *estado*. E o clip
+da caminhada (`SH_AR_S_MOV`) **não vem do registro**: vem da escolha do
+próprio conjunto de animação (`0x0017E280`), que olha o corpo de movimento
+(`actor+0x278`).
+
+Ou seja: **o registro diz o que o corpo está fazendo, e o conjunto de animação
+diz como ele está se movendo.** Por isso o corpo do parceiro precisa de duas
+coisas — o registro com a pose, e o movimento — ou o clip pedido pelo nome
+(`0x0017F990`).
+
+Três coisas que a investigação mediu e que mudam o desenho:
+
+- **Sem arma, o estado é respeitado.** Um ator sem arma (`actor+0x29C = 0`)
+  vai direto à escolha do clip, porque o caminho do corpo e da arma é o que
+  sobrescreveria o estado. É o caminho mais curto da rede até os ossos.
+- **Sem controlador de IA, o ator vivo não anima.** O tick do ator volta
+  antes do tick da animação quando `actor+0x324` é nulo. O corpo precisa de
+  um slot do gerenciador de IA com o índice do cérebro em −1, para a IA não
+  pensar.
+- **Com o par de identidade em 0/0, o corpo não é um objeto de script.** O
+  script nunca pega o handle dele, e o matcher de objetivos, que só percorre
+  o bus de eventos e a tabela de objetivos, nunca o casa. A missão não vê o
+  corpo.
+
 ## 6. O que está Explicitamente fora de escopo ainda
 
 - **O corpo do parceiro** (camada 3): o convidado ainda não vê o host de
-  pé no mapa. A receita está pronta (seção 4), falta a tabela de estados
-  (qual número é andar, correr, agachar, mirar, atirar) e a implementação.
+  pé no mapa. A receita e a tabela de estados estão prontas (seção 5); falta
+  a implementação — em particular, a escolha entre mover o corpo de
+  movimento (`actor+0x278`) e pedir o clip pelo nome (`0x0017F990`).
 - **A vida do jogador**: hoje é local em cada processo, com o PvP desligado.
   É uma decisão, não um acidente, e está escrita em `MODE.md`.
 - **A reconexão**: se um par cai no meio da fase, a sessão acaba. É o
