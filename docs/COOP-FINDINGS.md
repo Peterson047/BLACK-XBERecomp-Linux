@@ -209,12 +209,48 @@ achou coisas que a leitura do código não achou. Todas estão corrigidas:
   fase. Agora cada execução tem um diretório temporário, uma porta e um
   display seus.
 
+## 6b. O crash: a corrida entre duas threads
+
+O co-op morria em cerca de **um run em quatro**, com o heap corrompido. A
+assinatura enganava: o crash caía no **cache de shaders** do renderizador
+(`src/d3d/d3d8.cpp:104`) e no **texto dos prompts**
+(`src/game/prompts.cpp:44`), a léguas do código que o causou. Um heap
+corrompido aparece longe da causa.
+
+A causa: a camada de mundo e a de missão guardam estado que **duas threads**
+tocam — a thread do motor publica o dano e as ativações, e a thread que
+desenha monta o snapshot e aplica o que chega. O pior era
+`World::host_activations_`: um `std::vector` de `std::vector`, crescido pelo
+script do level do convidado na thread do motor **e** pela palavra de
+ativação do host chegando na thread de desenho. Dois threads empurrando no
+mesmo vetor corrompem o heap. Era o mesmo bug que a sessão tinha, um vetor
+mais abaixo.
+
+A correção: contadores e flags atômicos, os contêineres compartilhados sob o
+lock, e o publicador **copiado** sob o lock e **chamado** com ele solto, para
+a ordem de locks nunca cruzar (mundo → sessão → rede).
+
+E uma correção de segurança de memória de verdade: o *set-position* do motor
+escreve na matriz do ator **e na sua caixa**, então só é chamado num ator
+**vivo**. O slot de um ator morto ou reciclado pode já pertencer a outro
+objeto.
+
+O segundo crash, pego no gdb: o convidado morre no *attach* da animação do
+motor (`0x0017E420`) lendo `+0x14` do **descriptor** do ator
+(`actor+0x320`) sem teste de nulo — o descriptor é zero. É o mesmo crash do
+corpo do parceiro, e ele diz o que falta: **o corpo precisa de uma unidade do
+level de verdade**.
+
 ## 7. O que está Explicitamente fora de escopo ainda
 
-- **O corpo do parceiro** (camada 3): o convidado ainda não vê o host de
-  pé no mapa. A receita e a tabela de estados estão prontas (seção 5); falta
-  a implementação — em particular, a escolha entre mover o corpo de
-  movimento (`actor+0x278`) e pedir o clip pelo nome (`0x0017F990`).
+- **O corpo do parceiro** (camada 3): o corpo **existe e anima** — ele
+  nasce com o seu próprio controlador de animação, escolhe o seu clip, e
+  troca para o clip do disparo (`SH_AR_S_103`, estado 7) no instante em que o
+  tiro do parceiro chega. O que falta é ele **aparecer em cena**: ele é feito
+  à mão e não entra na lista de vivos do motor, então o motor não o desenha.
+  O caminho é o spawn nativo do personagem, com uma identidade que nenhum
+  objeto de script usa — assim o script nunca pega o handle do corpo e o
+  matcher de objetivos nunca o casa.
 - **A vida do jogador**: hoje é local em cada processo, com o PvP desligado.
   É uma decisão, não um acidente, e está escrita em `MODE.md`.
 - **A reconexão**: se um par cai no meio da fase, a sessão acaba. É o
