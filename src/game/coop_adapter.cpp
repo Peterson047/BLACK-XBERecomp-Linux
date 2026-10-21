@@ -165,8 +165,14 @@ void Adapter::Tick(float dt) {
         if (World::Get().ArmTestKill()) test_kill_armed_ = false;
     }
 
-    // The guest applies what arrived, on the thread that may touch the
-    // engine's memory.
+    // The mission watches the state of the objectives and the end of the
+    // level. It is pumped here, on the thread that draws, the same way the
+    // Deathmatch reads the engine's memory. The engine's own frame counter
+    // (0x000BE550) is never called, so it is not a place to pump it from.
+    //
+    // What the mission does to the engine - firing the event of the host in
+    // the guest's own bus - happens on the thread that runs the guest, in
+    // the tick of the bus.
     Mission::Get().Pump();
 
     if (phase == net::coop::Phase::Ended && !summary_logged_) {

@@ -20,6 +20,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -36,6 +37,10 @@ constexpr uint32_t kMaxObjectives = 64;
 // How many events of the host the mission keeps while it waits for the
 // engine's thread to apply them.
 constexpr size_t kInboxCapacity = 64;
+
+// How long the same object is not used again: the engine registers the
+// request of use again and again while the player holds the button.
+constexpr std::chrono::milliseconds kInteractionWindow{1000};
 
 // One of the level script's named events, as the host sees it and the guest
 // fires it again.
@@ -179,8 +184,11 @@ public:
     // the same. A difference is logged and counted.
     bool CompareState();
 
-    // Applies what arrived and watches the end of the mission. It has to run
-    // on the guest thread, once a frame.
+    // Watches the state of the objectives and the end of the mission, once a
+    // frame. It reads the table of the objectives, which is the engine's
+    // memory, so it runs on the thread that draws, the same way the
+    // Deathmatch reads the engine's memory. The state it keeps is under the
+    // lock, because the thread that runs the engine writes part of it.
     void Pump();
 
     // The guest: the events of the host that arrived, applied in the guest's
@@ -189,10 +197,21 @@ public:
     // thread, the events wait for one.
     void ApplyPending();
 
-    // The counters of the session.
-    uint32_t Events() const { return events_; }
-    uint32_t Unpaired() const { return unpaired_; }
-    uint32_t Divergent() const { return divergent_; }
+    // The counters of the session. They are read by the thread that draws,
+    // while the thread that runs the engine writes them, so they are read
+    // under the lock.
+    uint32_t Events() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return events_;
+    }
+    uint32_t Unpaired() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return unpaired_;
+    }
+    uint32_t Divergent() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return divergent_;
+    }
 
     // True while the guest is firing an event of the host in its own bus.
     bool IsReplaying() const { return replaying_; }
@@ -242,7 +261,10 @@ private:
     uint32_t divergence_count_ = 0;   // the state of the host in that divergence
     uint32_t divergence_done_ = 0;
     uint32_t last_object_ = 0;        // the last object the player used
-    uint32_t last_interaction_frame_ = 0;
+    // When the last object was used. The wall clock is what says whether a
+    // second went by: the engine's counter of frames is a count, and a count
+    // of frames is a second only at sixty frames a second.
+    std::chrono::steady_clock::time_point last_interaction_time_{};
     uint32_t last_world_ = 0;         // the world of the last reading
     bool objective_logged_ = false;   // the state of the mission was already logged
     uint32_t sequence_ = 0;   // the number of the events that went to the network
@@ -255,7 +277,10 @@ private:
     uint32_t scratch_allocs_ = 0;
     uint32_t scratch_frees_ = 0;
 
-    std::mutex mutex_;
+    // The lock of the state that two threads touch: the thread that runs the
+    // engine (which fires the events of the level script) and the thread that
+    // draws (which reads the counters of the session).
+    mutable std::mutex mutex_;
     std::deque<net::coop::Event> outbox_;  // the events the host has to publish
     std::deque<net::coop::Event> inbox_;   // the events the guest has to apply
     // The events the guest's own engine fired, in order. The event of the

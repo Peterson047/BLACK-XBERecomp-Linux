@@ -85,9 +85,17 @@ void CoopSession::Update(float dt) {
         }
 
         resend_timer_ += dt;
-        if (!unacked_.empty() && resend_timer_ >= kResendInterval) {
+        if (resend_timer_ >= kResendInterval) {
             resend_timer_ = 0.0f;
-            ResendUnacked();
+            // The list of what was not acknowledged is shared with the thread
+            // that publishes the events, so it is read under the lock. The
+            // packets go out after the lock is let go.
+            bool pending = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                pending = !unacked_.empty();
+            }
+            if (pending) ResendUnacked();
         }
     } else if (IsGuest()) {
         network_.SetPeerTimeout(phase_ == coop::Phase::Loading ? loading_timeout_ : lobby_timeout_);
@@ -96,21 +104,36 @@ void CoopSession::Update(float dt) {
 
 void CoopSession::PublishSnapshot(const coop::Snapshot& snapshot) {
     if (!enabled_ || !IsHost()) return;
-    pending_snapshot_ = snapshot;
-    pending_snapshot_.header.start_epoch = start_epoch_;
-    has_snapshot_ = true;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending_snapshot_ = snapshot;
+        pending_snapshot_.header.start_epoch = start_epoch_;
+        has_snapshot_ = true;
+    }
 }
 
 void CoopSession::PublishEvent(const coop::Event& event) {
     if (!enabled_ || !IsHost()) return;
     coop::Event outgoing = event;
     outgoing.state.start_epoch = start_epoch_;
-    outgoing.state.event_seq = ++next_event_seq_;
-    PendingEvent pending;
-    pending.event = outgoing;
-    pending.seq = outgoing.state.event_seq;
-    unacked_.push_back(pending);
-    sent_events_++;
+    {
+        // The events come from two threads: the damage of an actor is
+        // published from the engine's thread, inside the damage routine, and
+        // the events of the level script are published from the thread that
+        // draws. The number of the sequence and the list of what was not
+        // acknowledged are shared, so they are under a lock.
+        //
+        // The lock is not held while the packet goes out: the transport has
+        // its own lock, and the transport calls back into the session with
+        // its lock held. Holding both at once, in two orders, is a deadlock.
+        std::lock_guard<std::mutex> lock(mutex_);
+        outgoing.state.event_seq = ++next_event_seq_;
+        PendingEvent pending;
+        pending.event = outgoing;
+        pending.seq = outgoing.state.event_seq;
+        unacked_.push_back(pending);
+        sent_events_++;
+    }
     SendEvent(outgoing);
     LOGI("coop: event epoch=%u seq=%u type=%u", outgoing.state.start_epoch, outgoing.state.event_seq,
          outgoing.state.event_type);
@@ -250,11 +273,18 @@ void CoopSession::SendEvent(const coop::Event& event) {
 }
 
 void CoopSession::ResendUnacked() {
-    for (const PendingEvent& pending : unacked_) {
-        SendEvent(pending.event);
+    // The list is copied under the lock: the thread that publishes the events
+    // may be adding to it while the packets go out.
+    std::vector<PendingEvent> pending;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        pending = unacked_;
     }
-    if (!unacked_.empty()) {
-        LOGI("coop: resend events=%zu from=%u", unacked_.size(), unacked_.front().seq);
+    for (const PendingEvent& item : pending) {
+        SendEvent(item.event);
+    }
+    if (!pending.empty()) {
+        LOGI("coop: resend events=%zu from=%u", pending.size(), pending.front().seq);
     }
 }
 
@@ -411,6 +441,7 @@ void CoopSession::OnCoopAck(uint8_t player_id, const uint8_t* data, size_t size)
     }
     (void)player_id;
     // Everything up to the acknowledged sequence is done with.
+    std::lock_guard<std::mutex> lock(mutex_);
     unacked_.erase(std::remove_if(unacked_.begin(), unacked_.end(),
                                   [ack](const PendingEvent& pending) { return pending.seq <= ack.event_seq; }),
                    unacked_.end());

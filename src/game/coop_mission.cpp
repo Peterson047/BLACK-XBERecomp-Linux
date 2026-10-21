@@ -20,7 +20,6 @@
 //               the name, the text, the position and the count.
 //   0x001BAA40  the "use" of an object is registered in the list of the
 //               requests of use.
-//   0x000BE550  the frame counter, once a frame.
 //
 // The proof of each offset is in .agents/teamwork/coop/LAYOUT.md, section 7.
 
@@ -163,10 +162,14 @@ void Mission::OnInteraction(uint32_t object, uint16_t object_type, const float p
     // The engine registers the request of use again and again while the
     // player holds the button, so the same object only goes to the network
     // once: when another object is used, or when a second went by.
-    uint32_t frames = R32(kFrameCount);
-    if (object == last_object_ && frames - last_interaction_frame_ < 60) return;
+    //
+    // The clock is the wall clock, and not the engine's counter of frames:
+    // sixty frames is a second at sixty frames a second, and twice that at
+    // thirty.
+    const auto now = std::chrono::steady_clock::now();
+    if (object == last_object_ && now - last_interaction_time_ < kInteractionWindow) return;
     last_object_ = object;
-    last_interaction_frame_ = frames;
+    last_interaction_time_ = now;
 
     LOGI("coop: interaction epoch=%u type=%u pos=%g,%g,%g radius=%g", epoch_, object_type, pos[0], pos[1], pos[2],
          radius);
@@ -281,11 +284,14 @@ bool Mission::CompareState() {
 void Mission::NoteDivergence(uint32_t host_count, uint32_t host_done, const ObjectiveState& local) {
     // The same divergence is only counted and logged once: the check runs
     // every frame and the log would be full of the same line.
-    if (divergence_logged_ && divergence_count_ == host_count && divergence_done_ == host_done) return;
-    divergence_logged_ = true;
-    divergence_count_ = host_count;
-    divergence_done_ = host_done;
-    divergent_++;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (divergence_logged_ && divergence_count_ == host_count && divergence_done_ == host_done) return;
+        divergence_logged_ = true;
+        divergence_count_ = host_count;
+        divergence_done_ = host_done;
+        divergent_++;
+    }
     LOGE("coop: divergence epoch=%u what=objectives host=%u guest=%u objectives=%u done=%u", epoch_, host_done, local.done,
          local.count, local.done);
 }
@@ -326,7 +332,12 @@ void Mission::ApplyPending() {
                      named.event_id, named.kind, Safe(named.name, sizeof(named.name)).c_str(), named.count,
                      named.pos[0], named.pos[1], named.pos[2]);
                 FireLocal(named);
-                events_++;
+                {
+                    // The counter is read by the thread that draws the
+                    // summary, so it is written under the lock.
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    events_++;
+                }
                 break;
             }
             case net::coop::EventType::ObjectiveChanged:
@@ -561,14 +572,6 @@ X86_EXTERN_FUNC(__imp__sub_001337C0);
 X86_FUNC(sub_001337C0) {
     Mission::Get().ApplyPending();
     __imp__sub_001337C0(ctx, base);
-}
-
-// Once a frame: the mission applies what the host sent and watches the end of
-// the level.
-X86_EXTERN_FUNC(__imp__sub_000BE550);
-X86_FUNC(sub_000BE550) {
-    __imp__sub_000BE550(ctx, base);
-    Mission::Get().Pump();
 }
 
 }  // namespace

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <vector>
 
 #include "net/coop_protocol.h"
@@ -87,8 +88,15 @@ public:
     uint32_t GetDivergenceCount() const { return divergence_count_; }
     uint32_t GetStaleCount() const { return stale_count_; }
     uint32_t GetAppliedEventCount() const { return applied_events_; }
-    uint32_t GetSentEventCount() const { return sent_events_; }
-    uint32_t GetUnackedCount() const { return static_cast<uint32_t>(unacked_.size()); }
+    // The counters that the other threads touch are read under the lock.
+    uint32_t GetSentEventCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return sent_events_;
+    }
+    uint32_t GetUnackedCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return static_cast<uint32_t>(unacked_.size());
+    }
     uint32_t GetDroppedEventCount() const { return dropped_events_; }
     uint32_t GetSentSnapshotCount() const { return sent_snapshots_; }
     uint32_t GetReceivedSnapshotCount() const { return received_snapshots_; }
@@ -157,6 +165,12 @@ private:
         coop::Event event{};
         uint32_t seq = 0;
     };
+    // The lock of the state that two threads touch: the thread that publishes
+    // the events of the world (the engine's thread, inside the damage
+    // routine) and the thread that runs the session (the thread that draws).
+    // It is never held while a packet goes out, because the transport has its
+    // own lock and calls back into the session with it held.
+    mutable std::mutex mutex_;
     std::vector<PendingEvent> unacked_;
     uint32_t next_event_seq_ = 0;
     float resend_timer_ = 0.0f;

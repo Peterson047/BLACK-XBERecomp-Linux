@@ -169,8 +169,10 @@ constexpr uint32_t kUseRequestSize = 0x30;   // the size of a place
 constexpr uint32_t kFireEvent = 0x0012B8E0;    // the level script fires a named event
 constexpr uint32_t kQueueEvent = 0x0012B790;   // the bus takes an event
 constexpr uint32_t kUseRequest = 0x001BAA40;   // the "use" of an object is registered
-constexpr uint32_t kFrameTick = 0x000BE550;    // the frame counter
-constexpr uint32_t kFrameCount = 0x2F4368;     // the number of the frames that went
+// The number of the frames that went. The main loop (0x0020F6A0) counts the
+// frames itself; the function that only increments this counter (0x000BE550)
+// is never called, so it is not a place to hook a frame from.
+constexpr uint32_t kFrameCount = 0x2F4368;
 
 }  // namespace coop
 

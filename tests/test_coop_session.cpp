@@ -8,6 +8,7 @@
 
 #include <arpa/inet.h>
 #include <poll.h>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -19,6 +20,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 
 using namespace net;
@@ -292,6 +294,60 @@ int RunHost(uint16_t port, pid_t child, int control_fd, int report_fd, int scena
         return 0;
     }
 
+    if (scenario == 2) {
+        // Two threads publish at the same time.
+        //
+        // The events come from two threads: the damage of an actor is
+        // published from the engine's thread, inside the damage routine, and
+        // the events of the level script are published from the thread that
+        // draws. The number of the sequence and the list of what was not
+        // acknowledged are shared, so they are under a lock.
+        //
+        // Without the lock the two threads lose updates: the count of the
+        // events that went out is smaller than what was published, and two
+        // events can carry the same number of the sequence. The guest drops
+        // the second one, and the event never arrives.
+        constexpr int kPerThread = 500;
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        auto publish = [&](int count) {
+            ready++;
+            while (!go.load()) std::this_thread::yield();
+            for (int i = 0; i < count; ++i) {
+                Event event = MakeEvent(0, 0);
+                event.state.event_type = static_cast<uint8_t>(EventType::ActorDamaged);
+                session.PublishEvent(event);
+            }
+        };
+        std::thread first(publish, kPerThread);
+        std::thread second(publish, kPerThread);
+        while (ready.load() < 2) std::this_thread::yield();
+        go.store(true);
+        first.join();
+        second.join();
+
+        // Nothing was lost.
+        CHECK(session.GetSentEventCount() == static_cast<uint32_t>(kPerThread * 2));
+
+        // The guest applied every one of them: two events with the same
+        // number of the sequence would leave one of them out.
+        uint32_t applied = 0;
+        for (int attempt = 0; attempt < 40 && applied < static_cast<uint32_t>(kPerThread * 2); ++attempt) {
+            for (int i = 0; i < 20; ++i) {
+                network.Update(0.02f);
+                session.Update(0.02f);
+                usleep(10000);
+            }
+            WriteLine(control_fd, "applied");
+            CHECK(waiter.Line(line, 10000));
+            applied = static_cast<uint32_t>(std::stoul(line.substr(std::string("applied ").size())));
+        }
+        CHECK(applied == static_cast<uint32_t>(kPerThread * 2));
+
+        WriteLine(control_fd, "quit");
+        return 0;
+    }
+
     // The host names the mission. Nobody has loaded yet, so no round starts.
     session.HostStartMission(0);
     for (int i = 0; i < 15; ++i) {
@@ -382,7 +438,7 @@ int main() {
 
     // Each scenario gets its own pair of processes: the network manager is
     // a singleton, so two hosts cannot live in one process.
-    for (int scenario = 0; scenario < 2; ++scenario) {
+    for (int scenario = 0; scenario < 3; ++scenario) {
         int to_guest[2];
         int from_guest[2];
         CHECK(pipe(to_guest) == 0);
