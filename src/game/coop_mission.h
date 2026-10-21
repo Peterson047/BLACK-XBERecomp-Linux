@@ -249,6 +249,12 @@ private:
     uint32_t published_count_ = 0;  // the last state of the mission the host published
     uint32_t published_done_ = 0;
 
+    // The guest's memory that the replayed events needed, and that went back
+    // to the guest's heap. The two numbers have to be the same: a difference
+    // is a leak of the guest's address space.
+    uint32_t scratch_allocs_ = 0;
+    uint32_t scratch_frees_ = 0;
+
     std::mutex mutex_;
     std::deque<net::coop::Event> outbox_;  // the events the host has to publish
     std::deque<net::coop::Event> inbox_;   // the events the guest has to apply

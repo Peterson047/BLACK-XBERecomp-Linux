@@ -438,6 +438,7 @@ void Mission::FireLocal(const NamedEvent& event) {
         unpaired_++;
         return;
     }
+    scratch_allocs_++;
     uint32_t name = block;
     uint32_t text = block + kNameBytes;
     uint32_t pos = block + kNameBytes + kTextBytes;
@@ -455,11 +456,23 @@ void Mission::FireLocal(const NamedEvent& event) {
     ctx.eax = bus;
     CallGuest(ctx, kQueueEvent, {name, text, pos, event.count});
     replaying_ = false;
+
+    // The block goes back to the guest's heap. The engine copied the name,
+    // the text and the position into its own slot of the bus (the copy of
+    // the name is at bus+0x10E4, the text at bus+0x1164 and the position at
+    // bus+0x940), so nothing points into the block after the call. Without
+    // this every replayed event left 272 bytes of the guest's address space
+    // behind.
+    mem::FreeSystem(block);
+    scratch_frees_++;
 }
 
 void Mission::LogSummary() const {
     ObjectiveState state = ReadObjectives();
     LOGI("%s", SummaryLine(epoch_, state.count, state.done, events_, unpaired_, divergent_).c_str());
+    // The guest's memory that the replayed events used. The two numbers have
+    // to be the same: a difference is a leak of the guest's address space.
+    LOGI("coop: scratch epoch=%u alloc=%u free=%u", epoch_, scratch_allocs_, scratch_frees_);
 }
 
 void Mission::LogSummaryOnce() {

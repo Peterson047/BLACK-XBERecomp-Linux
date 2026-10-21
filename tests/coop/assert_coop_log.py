@@ -179,6 +179,19 @@ def main(argv):
             continue
         problems.append(f"the {name} published {len(published)} events; the guest is never a source")
 
+    # The memory the guest took for the replayed events has to go back to the
+    # guest's heap. A difference is a leak of the guest's address space.
+    for name, log in (("host", host), ("guest", guest)):
+        for fields in log.verbs("scratch"):
+            allocated = fields.get("alloc")
+            freed = fields.get("free")
+            if allocated is None or freed is None:
+                continue
+            if allocated != freed:
+                problems.append(
+                    f"the {name} took {allocated} blocks of the guest's memory and gave "
+                    f"{freed} back; the rest is a leak")
+
     # The sequences the guest applied have to be strictly increasing.
     sequences = []
     for _verb, fields, _raw in guest.entries:

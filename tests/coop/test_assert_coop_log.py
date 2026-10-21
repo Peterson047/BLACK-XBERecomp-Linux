@@ -77,6 +77,14 @@ CASES = [
     ("an actor that is still alive after the death fails",
      GOOD_HOST + "coop: test what=kill reason=applied actor=9 key_a=11 key_b=22 generation=3\n",
      GOOD_GUEST + "coop: apply kind=damage actor=9 key_a=11 key_b=22 generation=3 damage=1000 state=0\n", 1),
+    # The memory the guest took for the replayed events has to go back to the
+    # guest's heap.
+    ("the guest's memory that came back fails",
+     GOOD_HOST,
+     GOOD_GUEST + "coop: scratch epoch=1 alloc=3 free=1\n", 1),
+    ("the guest's memory that came back passes",
+     GOOD_HOST,
+     GOOD_GUEST + "coop: scratch epoch=1 alloc=3 free=3\n", 0),
 ]
 
 
