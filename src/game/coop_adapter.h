@@ -6,7 +6,7 @@
 // the mission layer talks to the level script. The adapter is what connects
 // them, and what decides which side of the co-op this process is.
 //
-// It runs in the same frame tick as the Deathmatch code, behind the same
+// It runs in the frame tick the game already has, behind the same
 // clock. It does not add a second one.
 
 #include <cstdint>

@@ -1,6 +1,7 @@
 #include "game/coop_adapter.h"
 
 #include "core/log.h"
+#include "game/coop_body.h"
 #include "game/coop_mission.h"
 #include "game/coop_world.h"
 #include "game/layout.h"
@@ -42,11 +43,15 @@ Adapter::Adapter() {
     session_.SetEventHandler([](const net::coop::Event& event) {
         World::Get().ApplyEvent(event);
         Mission::Get().ApplyEvent(event);
+        // The body of the partner: the shot is the state 7 of its record.
+        Body::Get().ApplyEvent(event);
     });
     session_.SetRoundHandler([this](uint32_t epoch, bool started) {
         if (!started) return;
         World::Get().ResetRound(epoch);
         Mission::Get().ResetRound(epoch);
+        // The round the events of the world belong to.
+        Body::Get().SetEpoch(epoch);
         // The test harness kills an enemy, so the replication of the death
         // can be checked without a player at the keyboard.
         if (TestKillEnabled()) test_kill_armed_ = true;
@@ -69,6 +74,11 @@ void Adapter::SetRole() {
             World::Get().SetRole(Role::kHost);
             Mission::Get().SetHost(true);
             World::Get().SetEventPublisher([](const net::coop::Event& event) {
+                Adapter::Get().session_.PublishEvent(event);
+            });
+            // The host publishes the shots of its own weapon: the guest's
+            // body plays the shot clip when the partner fires.
+            Body::Get().SetEventPublisher([](const net::coop::Event& event) {
                 Adapter::Get().session_.PublishEvent(event);
             });
             LOGI("coop: role host");
@@ -172,7 +182,7 @@ void Adapter::Tick(float dt) {
 
     // The mission watches the state of the objectives and the end of the
     // level. It is pumped here, on the thread that draws, the same way the
-    // Deathmatch reads the engine's memory. The engine's own frame counter
+    // The engine's memory is read from more than one thread. The engine's own frame counter
     // (0x000BE550) is never called, so it is not a place to pump it from.
     //
     // What the mission does to the engine - firing the event of the host in

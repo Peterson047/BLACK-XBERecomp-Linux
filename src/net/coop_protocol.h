@@ -51,6 +51,14 @@ enum class EventType : uint8_t {
     // to where the player is, and the two players are in different places -
     // so the guest has to be told, or the two worlds are not the same world.
     ActorActivated = 8,
+    // The host fired a shot. The shooting flag of the player's state is a
+    // level trigger: it comes from the timer of the muzzle flash and it is
+    // sampled at 30 Hz, so the guest can miss a shot. The host knows when
+    // the shot happened - the magazine went down - so the host publishes the
+    // shot as an event and the guest puts the partner's body in the state 7
+    // (the shot of the animation record) for the length of the shot.
+    // The number is appended: the numbers are mirrored in tests/e2e.
+    Shot = 9,
 };
 
 enum ActorFlags : uint16_t {

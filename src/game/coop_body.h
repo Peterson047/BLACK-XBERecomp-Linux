@@ -72,14 +72,10 @@ public:
     // would overwrite it otherwise.
     void AfterActorTick(uint32_t actor);
 
-    // The engine's thread, right before the engine's own tick of the actor.
-    //
-    // The engine's tick of a living actor (0x001F0860) reads the record and
-    // hands it to the state switch that picks the clip. The body writes its
-    // record here, so the clip of the frame is the clip of the state of the
-    // frame. The body has no weapon, and the tick of an actor without a
-    // weapon does not touch the record (LAYOUT.md section 11).
-    void BeforeActorTick(uint32_t actor);
+    // The frame of the engine, on the engine's thread. The body follows
+    // the partner and animates once a frame. The body drives its own
+    // animation, so it does not need the engine to tick it.
+    void Frame();
 
     // What the gate reads.
     uint32_t Actor() const { return actor_; }
@@ -104,12 +100,23 @@ private:
     // The host: the shot of the local player's weapon, when the magazine
     // goes down.
     void PublishLocalShot();
+    // The event of the shot, the way the magazine publishes it.
+    void PublishShot();
+    // The test harness: the host's own player fires, through the engine's
+    // trigger, so the shot crosses and the guest's body plays the clip.
+    void TestFire();
     // The partner's state, as the network has it. Null when there is no
     // partner yet.
     const net::PlayerStateData* PartnerState() const;
     // The anim set of a character type: the one of a soldier of the level
     // when there is one, the table's soldier otherwise.
     uint32_t FindAnimSet() const;
+    // The unit of the level of a soldier of the level: the bone update of
+    // the animation reads the unit of the actor.
+    uint32_t FindUnit() const;
+    // The animation of the body: the state switch, the anim set's own
+    // choice and the animation tick.
+    void Animate();
     // The body is still the one this layer made.
     bool Alive() const;
 
@@ -138,6 +145,7 @@ private:
     uint32_t created_ = 0;
     uint32_t heartbeat_ = 0;
     uint32_t failed_ = 0;
+    uint32_t test_fire_frame_ = 0;  // the test harness's trigger
 
     // The host: the magazine of the local player's weapon.
     uint16_t last_ammo_ = 0;
