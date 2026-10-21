@@ -155,10 +155,10 @@ private:
     bool loaded_ = false;
     bool ready_ = false;
 
-    // The snapshot the world layer handed over, waiting for its turn.
+    // The snapshot the world layer handed over. It goes out as soon as it
+    // arrives: the world layer already decides how often the world is read.
     coop::Snapshot pending_snapshot_{};
     bool has_snapshot_ = false;
-    float snapshot_timer_ = 0.0f;
 
     // The events the host sent and the guest has not acknowledged.
     struct PendingEvent {

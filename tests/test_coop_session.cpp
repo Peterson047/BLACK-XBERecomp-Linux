@@ -399,6 +399,18 @@ int RunHost(uint16_t port, pid_t child, int control_fd, int report_fd, int scena
     CHECK(waiter.Line(line, 10000));
     CHECK(line == "epoch 1");
 
+    // The snapshot goes out as soon as the world layer hands it over. A
+    // second clock in the session would make the rate depend on when the two
+    // clocks happen to agree, and the guest would see the actors in steps of
+    // two hundred milliseconds instead of a hundred.
+    {
+        Snapshot snapshot{};
+        snapshot.header.actor_count = 0;
+        const uint32_t sent = session.GetSentSnapshotCount();
+        session.PublishSnapshot(snapshot);
+        CHECK(session.GetSentSnapshotCount() == sent + 1);
+    }
+
     // The host publishes an event. The guest applies it once.
     Event event = MakeEvent(session.GetStartEpoch(), 1);
     session.PublishEvent(event);

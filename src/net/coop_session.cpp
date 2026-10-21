@@ -10,8 +10,6 @@
 namespace net {
 namespace {
 
-// How often the world snapshot goes out.
-constexpr float kSnapshotInterval = 0.1f;  // 10 Hz
 // How often the events that were not acknowledged are sent again.
 constexpr float kResendInterval = 0.2f;
 uint32_t NowMs() {
@@ -78,12 +76,6 @@ void CoopSession::Update(float dt) {
             PublishRoom();
         }
 
-        snapshot_timer_ += dt;
-        if (has_snapshot_ && snapshot_timer_ >= kSnapshotInterval) {
-            snapshot_timer_ = 0.0f;
-            SendSnapshot();
-        }
-
         resend_timer_ += dt;
         if (resend_timer_ >= kResendInterval) {
             resend_timer_ = 0.0f;
@@ -110,6 +102,12 @@ void CoopSession::PublishSnapshot(const coop::Snapshot& snapshot) {
         pending_snapshot_.header.start_epoch = start_epoch_;
         has_snapshot_ = true;
     }
+    // The snapshot goes out now. The world layer built it because the world
+    // changed, and it already decided how often that happens: a second clock
+    // here would make the rate depend on when the two clocks happen to agree,
+    // and the guest would see the actors in steps of two hundred milliseconds
+    // instead of a hundred.
+    SendSnapshot();
 }
 
 void CoopSession::PublishEvent(const coop::Event& event) {
