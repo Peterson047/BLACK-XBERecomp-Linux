@@ -50,75 +50,69 @@ from tests.e2e.common import (
 
 
 class TestTier4RealWorldScenarios(unittest.TestCase):
-    """Tier 4: Comprehensive Real-World Match and Combat Scenarios (6 tests)."""
+    """Tier 4: the real-world scenarios (6 tests).
 
-    def test_s1_full_deathmatch_round_scenario(self):
-        """S1: 4-player Deathmatch round simulation: join, spawn, movement, combat, killfeed, scoreboard."""
-        # 1. Join Phase
-        server_players = {}
-        for pid in range(1, 5):
-            req = pack_join_request(f"Soldier_{pid}")
-            ack = pack_join_ack(assigned_id=pid, max_players=8)
-            server_players[pid] = {
-                "name": f"Soldier_{pid}",
-                "health": 100.0,
-                "frags": 0,
-                "deaths": 0,
-                "pos": Vec3(*MISSION1_SPAWNS[pid - 1]),
-                "spawn_protection": 3.0,
-            }
-        self.assertEqual(len(server_players), 4)
+    S1 models a co-op session: the room, the load barrier, the world
+    snapshot and the events. The Deathmatch round it used to model is gone —
+    the branch is the co-op now.
 
-        # 2. Spawn protection expires
-        for p in server_players.values():
-            p["spawn_protection"] = 0.0
+    S2 to S6 still model the prototype's hit zones and spawn choice. They
+    are models of a mode the game no longer has, and they are worth nothing
+    as evidence about the game; they are kept because the models are the
+    clearest statement of the rules they were written for, and because
+    retiring them is a separate piece of work from the co-op.
+    """
 
-        # 3. Combat Engagement: Player 1 attacks Player 2
-        p1_pos = server_players[1]["pos"]
-        p2_pos = server_players[2]["pos"]
-        aim_dir = (p2_pos - p1_pos).normalize()
+    def test_s1_coop_session_scenario(self):
+        """S1: a co-op session: the room, the load barrier, the world snapshot and the events.
 
-        # Shot 1: Headshot (85 damage)
-        hit1 = simulate_hit_detection(
-            origin=Vec3(p1_pos.x, p1_pos.y + 1.55, p1_pos.z),
-            dir=aim_dir,
-            target_pos=Vec3(p2_pos.x, p2_pos.y + 1.65, p2_pos.z),
-            is_crouching=False
+        The Deathmatch round this test used to model is gone: the branch is
+        the co-op now. What the co-op does is the session, and this models it.
+        """
+        from tests.e2e.common import (
+            COOP_PHASE_IN_MISSION,
+            COOP_PHASE_LOADING,
+            COOP_PHASE_LOBBY,
+            coop_event,
+            coop_room,
+            coop_snapshot,
         )
-        self.assertIsNotNone(hit1)
-        self.assertEqual(hit1[0], ZONE_HEAD)
-        server_players[2]["health"] -= hit1[1]  # 100 - 85 = 15 HP
 
-        # Shot 2: Chest shot (34 damage) -> Elimination
-        hit2 = simulate_hit_detection(
-            origin=Vec3(p1_pos.x, p1_pos.y + 1.20, p1_pos.z),
-            dir=aim_dir,
-            target_pos=Vec3(p2_pos.x, p2_pos.y + 1.65, p2_pos.z),
-            is_crouching=False
-        )
-        self.assertIsNotNone(hit2)
-        self.assertEqual(hit2[0], ZONE_CHEST)
-        server_players[2]["health"] -= hit2[1]
+        # 1. The room: the host names the mission and both sides are in it.
+        room = coop_room(revision=1, phase=COOP_PHASE_LOBBY, present_mask=0b11)
+        self.assertEqual(room["phase"], COOP_PHASE_LOBBY)
+        self.assertEqual(room["present_mask"], 0b11)
 
-        # 4. Authoritative Scoring & Killfeed
-        killfeed = []
-        if server_players[2]["health"] <= 0.0:
-            server_players[1]["frags"] += 1
-            server_players[2]["deaths"] += 1
-            killfeed.append(f"{server_players[1]['name']} [FRAG] {server_players[2]['name']}")
+        # 2. The mission is named: the room goes to Loading and the epoch
+        #    still belongs to the round that has not started.
+        room = coop_room(revision=2, phase=COOP_PHASE_LOADING, present_mask=0b11)
+        self.assertEqual(room["phase"], COOP_PHASE_LOADING)
+        self.assertEqual(room["start_epoch"], 0)
 
-            # Respawn Player 2 safely
-            enemies = [server_players[i]["pos"] for i in [1, 3, 4]]
-            spawn_idx, new_pos = select_best_spawn(enemies, min_safe_dist=15.0)
-            server_players[2]["pos"] = new_pos
-            server_players[2]["health"] = 100.0
-            server_players[2]["spawn_protection"] = 3.0
+        # 3. Both sides loaded, so the round starts and the epoch moves.
+        room = coop_room(revision=3, phase=COOP_PHASE_IN_MISSION, start_epoch=1, present_mask=0b11,
+                         loaded_mask=0b11)
+        self.assertEqual(room["phase"], COOP_PHASE_IN_MISSION)
+        self.assertEqual(room["start_epoch"], 1)
 
-        self.assertEqual(server_players[1]["frags"], 1)
-        self.assertEqual(server_players[2]["deaths"], 1)
-        self.assertEqual(server_players[2]["health"], 100.0)
-        self.assertEqual(len(killfeed), 1)
-        self.assertIn("Soldier_1 [FRAG] Soldier_2", killfeed[0])
+        # 4. The world snapshot: the actors of the host, with their identity.
+        actors = [
+            {"native_a": 0x1111, "native_b": 0x2222, "generation": 3, "type": 1, "pos": [1.0, 0.0, 2.0]},
+            {"native_a": 0x3333, "native_b": 0x4444, "generation": 1, "type": 1, "pos": [3.0, 0.0, 4.0]},
+        ]
+        snapshot = coop_snapshot(actors, start_epoch=1)
+        self.assertEqual(snapshot["actor_count"], 2)
+        self.assertEqual(snapshot["start_epoch"], 1)
+        self.assertEqual(snapshot["actors"][0]["native_a"], 0x1111)
+        self.assertEqual(snapshot["actors"][0]["generation"], 3)
+
+        # 5. The events: a shot and a death, with their sequence numbers.
+        shot = coop_event(1, event_type=9, value=0.0)
+        death = coop_event(2, event_type=0, value=100.0, native_a=0x1111, native_b=0x2222, generation=3)
+        self.assertEqual(shot["event_seq"], 1)
+        self.assertEqual(death["event_seq"], 2)
+        self.assertEqual(death["native_a"], 0x1111)
+        self.assertEqual(death["generation"], 3)
 
     def test_s2_client_reconnect_and_session_recovery(self):
         """S2: Client disconnects mid-match and reconnects, regaining sync without corrupting state."""

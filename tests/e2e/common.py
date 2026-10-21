@@ -109,6 +109,25 @@ MSG_COOP_SNAPSHOT = 11
 MSG_COOP_EVENT = 12
 MSG_COOP_ACK = 13
 
+# The co-op phases (src/net/coop_protocol.h)
+COOP_PHASE_IDLE = 0
+COOP_PHASE_LOBBY = 1
+COOP_PHASE_LOADING = 2
+COOP_PHASE_IN_MISSION = 3
+COOP_PHASE_ENDED = 4
+
+# The co-op event types (src/net/coop_protocol.h)
+COOP_EVENT_DAMAGE = 0
+COOP_EVENT_DEATH = 1
+COOP_EVENT_INTERACTED = 2
+COOP_EVENT_PICKED = 3
+COOP_EVENT_OBJECTIVE = 4
+COOP_EVENT_MISSION_ENDED = 5
+COOP_EVENT_NAMED = 6
+COOP_EVENT_DESTRUCTION = 7
+COOP_EVENT_ACTIVATED = 8
+COOP_EVENT_FIRED = 9
+
 # Binary Packet Struct Formats (little-endian, packed)
 HEADER_FMT = "<IBBHI"  # magic (uint32), type (uint8), player_id (uint8), sequence (uint16), timestamp_ms (uint32)
 HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 12 bytes
@@ -432,3 +451,57 @@ def read_iso_volume_descriptor(iso_path: str) -> Optional[Tuple[int, int]]:
                 root_sector, root_size = struct.unpack("<II", f.read(8))
                 return (root_sector, root_size)
     return None
+
+
+# The co-op wire format, mirrored from src/net/coop_protocol.h. These are the
+# models the co-op tests use; the C++ is the thing they have to agree with.
+def coop_room(revision=1, phase=COOP_PHASE_LOBBY, start_epoch=0, session_id=1, mission_id=0,
+              present_mask=0, ready_mask=0, loaded_mask=0):
+    """The room the host publishes. The fields are the ones of RoomState."""
+    return {
+        "session_id": session_id,
+        "revision": revision,
+        "start_epoch": start_epoch,
+        "mission_id": mission_id,
+        "phase": phase,
+        "present_mask": present_mask,
+        "ready_mask": ready_mask,
+        "loaded_mask": loaded_mask,
+    }
+
+
+def coop_snapshot(actors, start_epoch=0, part_index=0, part_count=1):
+    """The world the host publishes. The actors are the ones of ActorState."""
+    return {
+        "start_epoch": start_epoch,
+        "actor_count": len(actors),
+        "part_index": part_index,
+        "part_count": part_count,
+        "actors": actors,
+    }
+
+
+def coop_event(event_seq, event_type=COOP_EVENT_DAMAGE, start_epoch=0, value=0.0, radius=0.0,
+               native_a=0, native_b=0, generation=0, object_type=0, damage_type=1, flags=0,
+               hit_state=0, extra=0, event_id=0, pos=(0.0, 0.0, 0.0), dir=(0.0, 0.0, 0.0),
+               text=("", "")):
+    """One event of the world. The fields are the ones of EventState."""
+    return {
+        "start_epoch": start_epoch,
+        "event_seq": event_seq,
+        "event_type": event_type,
+        "damage_type": damage_type,
+        "object_type": object_type,
+        "native_a": native_a,
+        "native_b": native_b,
+        "generation": generation,
+        "value": value,
+        "radius": radius,
+        "pos": list(pos),
+        "dir": list(dir),
+        "flags": flags,
+        "hit_state": hit_state,
+        "extra": extra,
+        "event_id": event_id,
+        "text": list(text),
+    }
