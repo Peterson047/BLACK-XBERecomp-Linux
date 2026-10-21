@@ -5,6 +5,9 @@
 #include <imgui.h>
 
 #include "common/menu.h"
+#include "game/coop_adapter.h"
+#include "game/coop_mission.h"
+#include "game/coop_world.h"
 #include "game/layout.h"
 
 namespace game {
@@ -69,7 +72,7 @@ void MultiplayerManager::DrawAdminDebug() {
     ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x * 0.82f, viewport->WorkSize.y * 0.78f),
                              ImGuiCond_FirstUseEver);
     bool open = true;
-    if (ImGui::Begin("Multiplayer - Admin Debug", &open, ImGuiWindowFlags_NoCollapse)) {
+    if (ImGui::Begin("Co-op - Admin Debug", &open, ImGuiWindowFlags_NoCollapse)) {
         ImGui::Text("Host UDP %u | %zu players | F8 / Escape to close", network.GetPort(), players.size());
         ImGui::TextWrapped("Live session: other players keep playing while this panel is open.");
         ImGui::SeparatorText("Native replication diagnostics");
@@ -78,9 +81,6 @@ void MultiplayerManager::DrawAdminDebug() {
             ImGui::Text("Actor container: %u used / %u capacity", kernel::R32(actors + 0x79B8),
                         kernel::R32(actors + 0x79B4));
         }
-        ImGui::Text("Confirmed local shots: %u | queued: %u",
-                    confirmed_shots_.load(std::memory_order_relaxed),
-                    pending_shots_.load(std::memory_order_relaxed));
         const uint32_t world = kernel::R32(layout::kWorld);
         if (world) {
             const uint32_t player = world + layout::kWorldPlayer;
@@ -91,43 +91,38 @@ void MultiplayerManager::DrawAdminDebug() {
                             magazine ? unsigned(kernel::G<uint16_t>(magazine + 0x18)) : 0u);
             }
         }
-        ImGui::TextWrapped("Native skeletal firing and ally targeting still require validation. Shot count tracks magazine consumption.");
-        ImGui::SeparatorText("Combat");
-        bool damage = network.IsDamageEnabled();
-        if (ImGui::Checkbox("Player damage", &damage)) network.SetDamageEnabled(damage);
-        float scale = network.GetDamageScale();
-        if (ImGui::SliderFloat("Damage multiplier", &scale, 0.0f, 5.0f, "%.2fx")) {
-            network.SetDamageScale(scale);
-        }
-        if (ImGui::Button("Reset kills / deaths")) network.AdminResetStats();
-        ImGui::SameLine();
-        if (ImGui::Button("Heal all players")) {
-            for (const auto& player : players) network.AdminHealPlayer(player.id);
-        }
+        ImGui::TextWrapped("Native skeletal firing and ally targeting still require validation.");
+
+        ImGui::SeparatorText("Co-op session");
+        auto& coop = coop::Adapter::Get();
+        auto& session = coop.Session();
+        auto& world_layer = coop::World::Get();
+        auto& mission = coop::Mission::Get();
+        const auto& objectives = mission.ReadObjectives();
+        ImGui::Text("Phase: %s   Round: %u", CoopPhaseName(session.GetPhase()), session.GetStartEpoch());
+        ImGui::Text("Objectives: %u of %u done", objectives.done, objectives.count);
+        ImGui::Text("Snapshots: %u sent, %u received", session.GetSentSnapshotCount(),
+                    session.GetReceivedSnapshotCount());
+        ImGui::Text("Events: %u sent, %u applied, %u unacked", session.GetSentEventCount(),
+                    session.GetAppliedEventCount(), session.GetUnackedCount());
+        ImGui::Text("Actors without a pair: %u   Divergences: %u",
+                    world_layer.UnpairedCount() + mission.Unpaired(),
+                    world_layer.DivergentCount() + mission.Divergent() + session.GetDivergenceCount());
 
         ImGui::SeparatorText("Players and replication");
         for (const auto& player : players) {
             ImGui::PushID(int(player.id));
             if (ImGui::TreeNodeEx("player", ImGuiTreeNodeFlags_DefaultOpen, "P%u %s%s", player.id,
-                    player.name.c_str(), player.id == network.GetLocalPlayerId() ? " (host / admin)" : "")) {
+                    player.name.c_str(), player.id == network.GetLocalPlayerId() ? " (host)" : "")) {
                 const auto& state = player.state;
-                ImGui::Text("HP %.1f | Kills %u | Deaths %u | Ping %.0f ms", state.health,
-                            state.frags, state.deaths, player.ping_ms);
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Heal")) network.AdminHealPlayer(player.id);
-                if (player.id != network.GetLocalPlayerId()) {
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton("Test hit: 10 HP")) {
-                        network.SendHit(player.id, 10.0f, player.state.pos);
-                    }
-                }
+                ImGui::Text("HP %.1f | Ping %.0f ms", state.health, player.ping_ms);
                 ImGui::Text("Position %.2f, %.2f, %.2f | Speed %.2f units/s", state.pos[0],
                     state.pos[1], state.pos[2], player.id < motion.size() ? motion[player.id].speed : 0.0f);
                 ImGui::Text("Yaw %.2f | Pitch %.2f | Weapon %u | Flags 0x%08X", state.yaw,
                             state.pitch, state.weapon_id, state.flags);
-                ImGui::Text("Firing %s | Aiming %s | Crouching %s | Reloading %s",
+                ImGui::Text("Firing %s | Aiming %s | Crouching %s | Moving %s",
                     state.flags & 1 ? "yes" : "no", state.flags & 2 ? "yes" : "no",
-                    state.flags & 4 ? "yes" : "no", state.flags & 8 ? "yes" : "no");
+                    state.flags & 4 ? "yes" : "no", state.flags & 16 ? "yes" : "no");
                 ImGui::Text("Endpoint: %s", player.endpoint_str.empty() ? "local" : player.endpoint_str.c_str());
                 ImGui::TreePop();
             }

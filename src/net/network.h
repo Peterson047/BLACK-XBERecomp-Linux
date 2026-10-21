@@ -21,6 +21,9 @@ enum class MsgType : uint8_t {
     JoinAck = 3,
     StateUpdate = 4,
     Shoot = 5,
+    // No longer used: the co-op has no player against player. The value
+    // stays so the numbers of the messages behind it do not move: they are
+    // mirrored in tests/e2e/common.py.
     Hit = 6,
     Disconnect = 7,
     Chat = 8,
@@ -51,8 +54,10 @@ struct PlayerStateData {
     float yaw;
     float pitch;
     uint32_t weapon_id;
-    uint32_t flags; // bit 0: firing, bit 1: aiming, bit 2: crouching, bit 3: reloading
+    uint32_t flags; // bit 0: firing, bit 1: aiming, bit 2: crouching, bit 4: moving
     float health;
+    // The score. The co-op has no score, but the fields
+    // stay: the layout of the packet is mirrored in tests/e2e/common.py.
     uint16_t frags;
     uint16_t deaths;
 };
@@ -79,13 +84,6 @@ struct PacketShoot {
     float origin[3];
     float dir[3];
     uint32_t weapon_id;
-};
-
-struct PacketHit {
-    PacketHeader header;
-    uint8_t victim_id;
-    float damage;
-    float hit_pos[3];
 };
 
 struct PacketChat {
@@ -136,7 +134,6 @@ public:
 
     void SendLocalState(const PlayerStateData& state);
     void BroadcastShoot(const float origin[3], const float dir[3], uint32_t weapon_id);
-    void SendHit(uint8_t victim_id, float damage, const float hit_pos[3]);
     void SendChatMessage(const std::string& msg);
 
     // Co-op. The transport carries the packets and does not know what they
@@ -153,14 +150,6 @@ public:
     void SendCoopToHost(const void* data, size_t size);
     // A bit per player that is in the session, the host included.
     uint8_t GetPresentMask() const;
-
-    // Host-only authoritative combat/debug controls. These return false on clients.
-    bool SetDamageEnabled(bool enabled);
-    bool SetDamageScale(float scale);
-    bool IsDamageEnabled() const;
-    float GetDamageScale() const;
-    bool AdminHealPlayer(uint8_t player_id);
-    bool AdminResetStats();
 
     NetMode GetMode() const { return mode_; }
     bool IsConnected() const;
@@ -183,7 +172,6 @@ private:
     void HandlePacket(const uint8_t* data, size_t size, void* sender_addr, uint32_t addr_len);
     void SendPacket(const void* data, size_t size, void* dest_addr, uint32_t addr_len);
     void CheckTimeouts();
-    void SendAuthoritativeState(uint8_t player_id);
     void SendJoinRequest();
 
     NetMode mode_ = NetMode::Offline;
@@ -195,10 +183,7 @@ private:
     uint16_t sequence_counter_ = 0;
     float current_ping_ms_ = 0.0f;
     float time_since_last_ping_ = 0.0f;
-    float time_since_last_state_broadcast_ = 0.0f;
     float time_since_last_join_ = 0.0f;
-    bool damage_enabled_ = true;
-    float damage_scale_ = 1.0f;
 
     // Co-op. The transport carries the packets; the session gives them meaning.
     CoopHandler* coop_handler_ = nullptr;
