@@ -99,8 +99,23 @@ public:
         return static_cast<uint32_t>(unacked_.size());
     }
     uint32_t GetDroppedEventCount() const { return dropped_events_; }
+    // The events that were not published because there was no round.
+    uint32_t GetSkippedEventCount() const { return skipped_events_; }
     uint32_t GetSentSnapshotCount() const { return sent_snapshots_; }
     uint32_t GetReceivedSnapshotCount() const { return received_snapshots_; }
+    // The number of the events that crossed to the other side.
+    //
+    // The guest counts the events it applied, and the host counts the events
+    // the guest acknowledged. It is the same number on the two sides, and it
+    // is the number that says whether the two sides handled the same events:
+    // the host publishes a few events more than the guest applies, because
+    // the guest leaves the session a little before the host does, and the
+    // event that was on its way is counted by one side only.
+    uint32_t GetCrossedEventCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (IsHost()) return crossed_events_;
+        return applied_events_;
+    }
     // The acknowledgements the guest sent. A repeated event is acknowledged
     // again, so a lost acknowledgement does not become a resend that never
     // ends.
@@ -182,6 +197,11 @@ private:
     uint32_t stale_count_ = 0;
     uint32_t applied_events_ = 0;
     uint32_t sent_events_ = 0;
+    // The events the guest acknowledged: the number of the events that
+    // crossed, seen from the host.
+    uint32_t crossed_events_ = 0;
+    // The events that were published outside a round and did not go out.
+    uint32_t skipped_events_ = 0;
     uint32_t dropped_events_ = 0;
     uint32_t sent_snapshots_ = 0;
     uint32_t received_snapshots_ = 0;

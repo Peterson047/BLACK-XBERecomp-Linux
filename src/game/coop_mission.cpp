@@ -84,6 +84,10 @@ void Mission::ResetRound(uint32_t epoch) {
     sequence_ = 0;
     published_count_ = 0;
     published_done_ = 0;
+    // The state of the objectives is published again in the new round: the
+    // events of the session only exist inside a round, so the one that was
+    // published before the round began did not go out.
+    objective_logged_ = false;
     outbox_.clear();
     inbox_.clear();
 }

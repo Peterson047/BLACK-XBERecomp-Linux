@@ -307,6 +307,22 @@ int RunHost(uint16_t port, pid_t child, int control_fd, int report_fd, int scena
         // events that went out is smaller than what was published, and two
         // events can carry the same number of the sequence. The guest drops
         // the second one, and the event never arrives.
+        //
+        // The events belong to a round: the ones published outside one do
+        // not go out, so the round has to begin first.
+        session.HostStartMission(0);
+        session.SetLoaded(true);
+        WriteLine(control_fd, "loaded");
+        CHECK(waiter.Line(line, 10000));
+        CHECK(line == "loaded");
+        for (int i = 0; i < 100 && rounds == 0; ++i) {
+            session.Update(0.02f);
+            network.Update(0.02f);
+            usleep(10000);
+        }
+        CHECK(rounds == 1);
+        CHECK(session.GetPhase() == Phase::InMission);
+
         constexpr int kPerThread = 500;
         std::atomic<int> ready{0};
         std::atomic<bool> go{false};
@@ -314,7 +330,7 @@ int RunHost(uint16_t port, pid_t child, int control_fd, int report_fd, int scena
             ready++;
             while (!go.load()) std::this_thread::yield();
             for (int i = 0; i < count; ++i) {
-                Event event = MakeEvent(0, 0);
+                Event event = MakeEvent(session.GetStartEpoch(), 0);
                 event.state.event_type = static_cast<uint8_t>(EventType::ActorDamaged);
                 session.PublishEvent(event);
             }

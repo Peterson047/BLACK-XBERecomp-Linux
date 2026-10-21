@@ -195,12 +195,16 @@ void Adapter::LogSummary() {
     Mission::Get().LogSummaryOnce();
     const uint32_t epoch = session_.GetStartEpoch();
     const uint32_t snapshots = session_.GetSentSnapshotCount() + session_.GetReceivedSnapshotCount();
-    const uint32_t events = session_.GetSentEventCount() + session_.GetAppliedEventCount();
+    // The events that crossed: the same number on the two sides, so the two
+    // summaries can be compared. The host publishes a few events more than
+    // the guest applies, because the guest leaves the session a little
+    // before the host does.
+    const uint32_t events = session_.GetCrossedEventCount();
     const uint32_t unpaired = World::Get().UnpairedCount() + Mission::Get().Unpaired();
     const uint32_t divergent =
         World::Get().DivergentCount() + Mission::Get().Divergent() + session_.GetDivergenceCount();
     LOGI("coop: summary epoch=%u snapshots=%u events=%u acked=%u unpaired=%u divergent=%u", epoch, snapshots, events,
-         session_.GetAppliedEventCount(), unpaired, divergent);
+         events, unpaired, divergent);
 }
 
 }  // namespace coop

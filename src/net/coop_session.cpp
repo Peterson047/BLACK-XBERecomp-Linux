@@ -44,6 +44,8 @@ void CoopSession::SetEnabled(bool enabled) {
         stale_count_ = 0;
         applied_events_ = 0;
         sent_events_ = 0;
+        crossed_events_ = 0;
+        skipped_events_ = 0;
         dropped_events_ = 0;
         unacked_.clear();
         pending_events_.clear();
@@ -112,6 +114,14 @@ void CoopSession::PublishSnapshot(const coop::Snapshot& snapshot) {
 
 void CoopSession::PublishEvent(const coop::Event& event) {
     if (!enabled_ || !IsHost()) return;
+    if (phase_ != coop::Phase::InMission) {
+        // An event outside a round has no place: the round counts the
+        // events from one, and the guest would count an event that the host
+        // does not count, because the guest counts the events it applied
+        // and the host counts the ones the guest acknowledged.
+        skipped_events_++;
+        return;
+    }
     coop::Event outgoing = event;
     outgoing.state.start_epoch = start_epoch_;
     {
@@ -469,6 +479,9 @@ void CoopSession::OnCoopAck(uint8_t player_id, const uint8_t* data, size_t size)
     (void)player_id;
     // Everything up to the acknowledged sequence is done with.
     std::lock_guard<std::mutex> lock(mutex_);
+    // The events that crossed: the guest says how far it got, and the
+    // number it says is the number of the events both sides handled.
+    if (ack.event_seq > crossed_events_) crossed_events_ = ack.event_seq;
     unacked_.erase(std::remove_if(unacked_.begin(), unacked_.end(),
                                   [ack](const PendingEvent& pending) { return pending.seq <= ack.event_seq; }),
                    unacked_.end());
