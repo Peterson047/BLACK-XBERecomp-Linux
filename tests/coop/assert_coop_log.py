@@ -118,6 +118,28 @@ def main(argv):
                         problems.append(
                             f"the guest's actor is still alive after the host's death: state={a.get('state')}")
 
+    # The body of the partner. When the guest made one, it has to be
+    # animating, and when the partner fired, it has to have played the shot.
+    body = [f for v, f, _ in guest.entries if v == "body" and f.get("what") == "created"]
+    if body:
+        clips = [f for v, f, _ in guest.entries if v == "body" and f.get("what") == "clip"]
+        if not clips:
+            problems.append("the guest made the body of the partner and it never picked a clip")
+        else:
+            names = {f.get("clip") for f in clips}
+            if len(names) < 2:
+                problems.append(f"the body of the partner never changed its clip: {sorted(names)}")
+            # the shot: the host published one, so the body has to have played it
+            shots = [f for v, f, _ in host.entries if v == "body" and f.get("what") == "publish"
+                     and f.get("event") == "shot"]
+            if shots:
+                played = [f for v, f, _ in guest.entries if v == "body" and f.get("what") == "shot"]
+                if not played:
+                    problems.append("the host fired and the guest's body played no shot")
+                states = {f.get("state") for f in clips}
+                if states and "7" not in states:
+                    problems.append(f"the body of the partner never held the state of the shot: {sorted(states)}")
+
     if problems:
         return fail("; ".join(problems))
 
@@ -247,6 +269,28 @@ def main(argv):
                     if a.get("state") not in (None, "1", "2"):
                         problems.append(
                             f"the guest's actor is still alive after the host's death: state={a.get('state')}")
+
+    # The body of the partner. When the guest made one, it has to be
+    # animating, and when the partner fired, it has to have played the shot.
+    body = [f for v, f, _ in guest.entries if v == "body" and f.get("what") == "created"]
+    if body:
+        clips = [f for v, f, _ in guest.entries if v == "body" and f.get("what") == "clip"]
+        if not clips:
+            problems.append("the guest made the body of the partner and it never picked a clip")
+        else:
+            names = {f.get("clip") for f in clips}
+            if len(names) < 2:
+                problems.append(f"the body of the partner never changed its clip: {sorted(names)}")
+            # the shot: the host published one, so the body has to have played it
+            shots = [f for v, f, _ in host.entries if v == "body" and f.get("what") == "publish"
+                     and f.get("event") == "shot"]
+            if shots:
+                played = [f for v, f, _ in guest.entries if v == "body" and f.get("what") == "shot"]
+                if not played:
+                    problems.append("the host fired and the guest's body played no shot")
+                states = {f.get("state") for f in clips}
+                if states and "7" not in states:
+                    problems.append(f"the body of the partner never held the state of the shot: {sorted(states)}")
 
     if problems:
         return fail("; ".join(problems))

@@ -71,6 +71,28 @@ CASES = [
     ("a death that crossed passes",
      GOOD_HOST + "coop: test what=kill reason=applied actor=9 key_a=11 key_b=22 generation=3\n",
      GOOD_GUEST + "coop: apply kind=damage actor=9 key_a=11 key_b=22 generation=3 damage=1000 state=1\n", 0),
+    # the body of the partner
+    ("a body that never picks a clip fails",
+     GOOD_HOST, GOOD_GUEST + "coop: body what=created actor=9 anim=1 animset=2 unit=3\n", 1),
+    ("a body whose clip never changes fails",
+     GOOD_HOST,
+     GOOD_GUEST + "coop: body what=created actor=9 anim=1 animset=2 unit=3\n"
+     "coop: body what=clip actor=9 clip=SH_AR_S_560 state=1 speed=0.000\n", 1),
+    ("a body that changes its clip passes",
+     GOOD_HOST,
+     GOOD_GUEST + "coop: body what=created actor=9 anim=1 animset=2 unit=3\n"
+     "coop: body what=clip actor=9 clip=SH_AR_S_560 state=1 speed=0.000\n"
+     "coop: body what=clip actor=9 clip=SH_AR_S_103 state=7 speed=0.000\n", 0),
+    ("a shot the body did not play fails",
+     GOOD_HOST + "coop: body what=publish event=shot epoch=1 seconds=0.12 weapon=5\n",
+     GOOD_GUEST + "coop: body what=created actor=9 anim=1 animset=2 unit=3\n"
+     "coop: body what=clip actor=9 clip=SH_AR_S_560 state=1 speed=0.000\n", 1),
+    ("a shot the body played passes",
+     GOOD_HOST + "coop: body what=publish event=shot epoch=1 seconds=0.12 weapon=5\n",
+     GOOD_GUEST + "coop: body what=created actor=9 anim=1 animset=2 unit=3\n"
+     "coop: body what=shot event=shot seq=6 seconds=0.12\n"
+     "coop: body what=clip actor=9 clip=SH_AR_S_560 state=1 speed=0.000\n"
+     "coop: body what=clip actor=9 clip=SH_AR_S_103 state=7 speed=0.000\n", 0),
     ("a death that crossed to another actor fails",
      GOOD_HOST + "coop: test what=kill reason=applied actor=9 key_a=11 key_b=22 generation=3\n",
      GOOD_GUEST + "coop: apply kind=damage actor=9 key_a=11 key_b=99 generation=3 damage=1000 state=1\n", 1),
