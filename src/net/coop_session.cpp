@@ -356,7 +356,13 @@ void CoopSession::OnCoopEvent(const uint8_t* data, size_t size) {
     }
     if (event.state.event_seq <= last_applied_seq_) {
         // Already applied. A repeated packet must not kill an actor twice.
+        //
+        // The acknowledgement goes out anyway. The host resends what it has
+        // not seen acknowledged, so if the first acknowledgement was lost the
+        // host would resend this event for the rest of the session, and the
+        // guest would drop it again and again.
         dropped_events_++;
+        SendAck();
         return;
     }
     if (event.state.event_seq > last_applied_seq_ + 1) {
@@ -371,6 +377,13 @@ void CoopSession::OnCoopEvent(const uint8_t* data, size_t size) {
     DrainPending();
 
     // Tell the host how far we got, so it can stop sending.
+    SendAck();
+}
+
+// The guest tells the host how far it got. The acknowledgement is
+// idempotent: it says "everything up to this sequence is applied", so the
+// guest can send it again without harm.
+void CoopSession::SendAck() {
     coop::AckState ack{};
     ack.start_epoch = start_epoch_;
     ack.event_seq = last_applied_seq_;
@@ -384,6 +397,7 @@ void CoopSession::OnCoopEvent(const uint8_t* data, size_t size) {
     std::memcpy(buffer, &header, sizeof(header));
     const size_t written = coop::EncodeAck(ack, buffer + sizeof(header), sizeof(buffer) - sizeof(header));
     if (written == 0) return;
+    acks_sent_++;
     network_.SendCoopToHost(buffer, sizeof(header) + written);
 }
 

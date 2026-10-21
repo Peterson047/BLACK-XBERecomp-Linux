@@ -166,6 +166,14 @@ void TestOrderingRules() {
     CHECK(applied == 1);
     CHECK(session.GetDroppedEventCount() == 1);
 
+    // ... but it is acknowledged again. The host resends what it has not seen
+    // acknowledged, so an event that arrives twice and is not acknowledged
+    // the second time is resent for the rest of the session.
+    const uint32_t acks = session.GetAckCount();
+    session.OnCoopEvent(first_bytes.data(), first_bytes.size());
+    CHECK(session.GetAckCount() == acks + 1);
+    CHECK(applied == 1);
+
     // An event that arrives early waits for its turn, and the hole is
     // counted so it is visible.
     Event third = MakeEvent(4, 3);

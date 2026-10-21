@@ -92,6 +92,10 @@ public:
     uint32_t GetDroppedEventCount() const { return dropped_events_; }
     uint32_t GetSentSnapshotCount() const { return sent_snapshots_; }
     uint32_t GetReceivedSnapshotCount() const { return received_snapshots_; }
+    // The acknowledgements the guest sent. A repeated event is acknowledged
+    // again, so a lost acknowledgement does not become a resend that never
+    // ends.
+    uint32_t GetAckCount() const { return acks_sent_; }
 
     // The summary the log gate reads.
     std::string Summary() const;
@@ -112,6 +116,8 @@ private:
     void SendReady();
     void SendSnapshot();
     void SendEvent(const coop::Event& event);
+    // The guest tells the host how far it got.
+    void SendAck();
     void ResendUnacked();
     void StartRound();
     void ApplyEvent(const coop::Event& event);
@@ -167,6 +173,7 @@ private:
     uint32_t dropped_events_ = 0;
     uint32_t sent_snapshots_ = 0;
     uint32_t received_snapshots_ = 0;
+    uint32_t acks_sent_ = 0;
     float room_timer_ = 0.0f;
 
     float lobby_timeout_ = 5.0f;
