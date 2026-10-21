@@ -9,16 +9,17 @@ A especificação é `docs/COOP.md`; os offsets verificados são
 
 | peça | como se sabe |
 |---|---|
-| A sessão de rede | `tests/test_coop_session.cpp`: a barreira de carga, a sala, a sequência, o acuse de recibo e o timeout que sobrevive ao carregamento |
+| A sessão de rede | `tests/test_coop_session.cpp`: a barreira de carga, a sala, a sequência, o acuse de recibo, o timeout que sobrevive ao carregamento e duas threads publicando ao mesmo tempo |
 | O formato da rede | `tests/test_coop_protocol.cpp`: ida e volta, os limites, o tamanho do datagrama |
 | A camada de mundo | `tests/test_coop_world.cpp`: a identidade, o emparelhamento, a ordem dos eventos |
 | A camada de missão | `tests/test_coop_mission.cpp`: o nome do evento, os objetivos, o fim da missão |
-| As duas instâncias | `tools/dev_check.sh coop`: `epoch=1 snapshots=389 events=21 unpaired=0 divergent=0` |
+| As duas instâncias | `tools/dev_check.sh coop`: `epoch=1 snapshots=386 events=23 unpaired=0 divergent=0` |
 
 O gate de log (`tests/coop/assert_coop_log.py`) compara as duas cópias do log:
 a mesma rodada, nenhum ator sem par, nenhuma divergência, nenhum erro, as
-sequências em ordem e o convidado nunca como fonte. Ele tem os seus próprios
-casos, porque um portão que não pode falhar não é um portão.
+sequências em ordem, o convidado nunca como fonte e a memória que o convidado
+tomou do motor devolvida. Ele tem os seus próprios casos, porque um portão
+que não pode falhar não é um portão.
 
 ## 2. As três coisas que a spec errou
 
@@ -170,7 +171,45 @@ Três coisas que a investigação mediu e que mudam o desenho:
   o bus de eventos e a tabela de objetivos, nunca o casa. A missão não vê o
   corpo.
 
-## 6. O que está Explicitamente fora de escopo ainda
+## 6. O que o portão encontrou (a corrida e os enganos)
+
+O portão das duas instâncias é o que mede o comportamento de verdade, e ele
+achou coisas que a leitura do código não achou. Todas estão corrigidas:
+
+- **A sessão publicava de duas threads ao mesmo tempo.** O dano de um ator é
+  publicado da thread do motor, dentro da rotina de dano, e os eventos do
+  script do level são publicados da thread que desenha. A lista do que não
+  foi acuse de recibo e o número da sequência são compartilhados, e não
+  estavam sob uma trava: duas threads empurrando para o mesmo vetor
+  corrompem o heap. O teste que publica de duas threads ao mesmo tempo
+  aborta com `double free or corruption` contra o código antigo.
+- **O convidado descartava o evento repetido sem responder.** O host reenvia
+  o que não viu ser acuse de recibo, então um acuse perdido virava um
+  reenvio eterno, e o contador de eventos descartados crescia sem parar.
+- **A inbox da missão encheu com dano.** A missão enfileirava todo evento do
+  host e jogava fora o que não usava; o dano de um ator ocupava o lugar do
+  evento de uma missão, e sessenta e quatro acertos eram suficientes para
+  empurrar o evento de uma missão para fora.
+- **O convidado vazava a memória do motor.** Cada evento replicado tomava
+  272 bytes do espaço do guest e não devolvia. O motor copia o nome, o texto
+  e a posição para o slot dele, então o bloco pode voltar para a heap do
+  guest. A missão conta o que tomou e o que devolveu, e o portão compara os
+  dois números.
+- **O gancho do frame tick da missão era código morto.** A função que só
+  incrementa o contador de frames (`0x000BE550`) nunca é chamada: quem
+  conta os frames é o laço principal (`0x0020F6A0`). Hookar a função morta
+  não dava tick nenhum, e a missão dependia de outro caminho.
+- **Um evento existia fora da rodada.** O host publicava a mudança do
+  estado dos objetivos enquanto o level ainda carregava; o convidado aplicava
+  e contava, e o host não. As duas sides discordavam do número de eventos e
+  o portão acusava divergência onde não havia.
+- **O próprio portão media a execução errada.** Ele escrevia em caminhos
+  fixos de `/tmp` e usava uma porta e um display X fixos: duas execuções ao
+  mesmo tempo se misturavam, e uma derrubava a janela da outra no meio da
+  fase. Agora cada execução tem um diretório temporário, uma porta e um
+  display seus.
+
+## 7. O que está Explicitamente fora de escopo ainda
 
 - **O corpo do parceiro** (camada 3): o convidado ainda não vê o host de
   pé no mapa. A receita e a tabela de estados estão prontas (seção 5); falta
