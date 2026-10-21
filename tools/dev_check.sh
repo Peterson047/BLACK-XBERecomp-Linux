@@ -19,6 +19,27 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
+# Everything this script writes goes into a directory of its own. The gate is
+# run by more than one session at a time, and a fixed path in /tmp means that
+# one session reads the output of the other: the two instance gate then checks
+# a run that is not its own and blames the co-op for it.
+CHECK_TMP="$(mktemp -d /tmp/dev-check-XXXXXX)"
+cleanup() { rm -rf "$CHECK_TMP"; }
+trap cleanup EXIT
+
+# A port that nothing is using. The two instances of the gate need one each,
+# and two hosts on the same port do not talk to each other: the second one
+# fails to bind and its guest joins the first host.
+pick_port() {
+    python3 - <<'PY'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
+
 CXX="${CXX:-clang++}"
 IMGUI="${IMGUI_DIR:-}"
 if [[ -z "$IMGUI" ]]; then
@@ -60,11 +81,11 @@ run_syntax() {
     for src in "${GAME_SOURCES[@]}"; do
         [[ -f "$src" ]] || continue
         if "$CXX" -std=c++20 -fsyntax-only -Isrc -Isdk/runtime -Igenerated/game -I"$IMGUI" \
-            -Wno-nontrivial-memcall "$src" 2>/tmp/dev_check_err.txt; then
+            -Wno-nontrivial-memcall "$src" 2>"$CHECK_TMP/err.txt"; then
             echo "  ok   $src"
         else
             echo "  FAIL $src"
-            sed -n '1,25p' /tmp/dev_check_err.txt | sed 's/^/       /'
+            sed -n '1,25p' "$CHECK_TMP/err.txt" | sed 's/^/       /'
             failed=1
         fi
     done
@@ -93,22 +114,22 @@ run_cpp() {
             echo "  SKIP $test (a source it needs is not there yet)"
             continue
         fi
-        local out="/tmp/$(basename "${test%.cpp}")"
+        local out="$CHECK_TMP/$(basename "${test%.cpp}")"
         local link=()
         for extra in "${parts[@]:1}"; do link+=("$extra"); done
         if "$CXX" -std=c++20 -Isrc -Isdk/runtime "$test" "${link[@]}" \
-            sdk/runtime/core/log.cpp -pthread -o "$out" 2>/tmp/dev_check_err.txt; then
-            if "$out" >/tmp/dev_check_out.txt 2>&1; then
+            sdk/runtime/core/log.cpp -pthread -o "$out" 2>"$CHECK_TMP/err.txt"; then
+            if "$out" >"$CHECK_TMP/out.txt" 2>&1; then
                 echo "  ok   $test"
-                tail -1 /tmp/dev_check_out.txt | sed 's/^/       /'
+                tail -1 "$CHECK_TMP/out.txt" | sed 's/^/       /'
             else
                 echo "  FAIL $test (ran, exited non-zero)"
-                tail -20 /tmp/dev_check_out.txt | sed 's/^/       /'
+                tail -20 "$CHECK_TMP/out.txt" | sed 's/^/       /'
                 fail=1
             fi
         else
             echo "  FAIL $test (did not build)"
-            sed -n '1,25p' /tmp/dev_check_err.txt | sed 's/^/       /'
+            sed -n '1,25p' "$CHECK_TMP/err.txt" | sed 's/^/       /'
             fail=1
         fi
     done
@@ -121,13 +142,13 @@ run_e2e() {
         echo "  SKIP: tests/e2e/runner.py not found"
         return 0
     fi
-    if python3 tests/e2e/runner.py >/tmp/dev_check_e2e.txt 2>&1; then
+    if python3 tests/e2e/runner.py >"$CHECK_TMP/e2e.txt" 2>&1; then
         echo "  ok   tests/e2e/runner.py"
-        grep -E "^(Total Tests Executed|Passed|Failed):" /tmp/dev_check_e2e.txt | sed 's/^/       /'
+        grep -E "(Total Tests Executed|Passed|Failed):" "$CHECK_TMP/e2e.txt" | sed 's/^/       /'
     else
         echo "  FAIL tests/e2e/runner.py"
-        grep -E "^(Total Tests Executed|Passed|Failed):" /tmp/dev_check_e2e.txt | sed 's/^/       /'
-        grep -E "^  - " /tmp/dev_check_e2e.txt | sed 's/^/       /' | head -20
+        grep -E "(Total Tests Executed|Passed|Failed):" "$CHECK_TMP/e2e.txt" | sed 's/^/       /'
+        grep -E "^  - " "$CHECK_TMP/e2e.txt" | sed 's/^/       /' | head -20
         fail=1
     fi
     return 0
@@ -139,11 +160,11 @@ run_coop() {
         echo "  SKIP: the co-op log checker is not there yet"
         return 0
     fi
-    if python3 tests/coop/test_assert_coop_log.py >/tmp/dev_check_coop.txt 2>&1; then
+    if python3 tests/coop/test_assert_coop_log.py >"$CHECK_TMP/coop.txt" 2>&1; then
         echo "  ok   the log checker catches what it should"
     else
         echo "  FAIL the log checker"
-        tail -20 /tmp/dev_check_coop.txt | sed 's/^/       /'
+        tail -20 "$CHECK_TMP/coop.txt" | sed 's/^/       /'
         fail=1
     fi
 
@@ -158,14 +179,15 @@ run_coop() {
         return 0
     fi
     echo "== two instance gate =="
-    if ! tools/coop_run.sh "${COOP_RUN_SECONDS:-45}" "${COOP_RUN_PORT:-15199}" >/tmp/dev_check_run.txt 2>&1; then
+    local port="${COOP_RUN_PORT:-$(pick_port)}"
+    if ! tools/coop_run.sh "${COOP_RUN_SECONDS:-45}" "$port" >"$CHECK_TMP/run.txt" 2>&1; then
         echo "  FAIL the two instances did not run"
-        tail -20 /tmp/dev_check_run.txt | sed 's/^/       /'
+        tail -20 "$CHECK_TMP/run.txt" | sed 's/^/       /'
         fail=1
         return 0
     fi
     local run_dir
-    run_dir="$(grep -o '/tmp/coop-run-[A-Za-z0-9]*' /tmp/dev_check_run.txt | head -1)"
+    run_dir="$(grep -o '/tmp/coop-run-[A-Za-z0-9]*' "$CHECK_TMP/run.txt" | head -1)"
     if [[ -z "$run_dir" || ! -f "$run_dir/host.out" || ! -f "$run_dir/guest.out" ]]; then
         echo "  SKIP: the two instance gate, the run produced no logs"
         return 0
